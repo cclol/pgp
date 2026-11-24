@@ -1,0 +1,81 @@
+name: Build, Verify, and Deploy Pages
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify pinned Rust toolchain and wasm32 target
+        run: |
+          rustc --version
+          cargo --version
+          rustup target list --installed
+
+      - name: Run Rust unit and packet-audit tests
+        run: cargo test --locked
+
+      - name: Build Wasm crypto core (release, locked)
+        run: cargo build --target wasm32-unknown-unknown --release --locked
+
+      - name: Build single-file standalone HTML with SHA-256 CSP
+        run: |
+          python3 scripts/build.py
+          sha256sum dist/index.html > dist/index.html.sha256
+          cat dist/index.html.sha256
+
+      - name: Verify CSP and absence of external URLs in built HTML
+        run: |
+          python3 -c '
+          import pathlib, sys
+          html = pathlib.Path("dist/index.html").read_text(encoding="utf-8")
+          assert "default-src \x27none\x27" in html, "missing default-src none"
+          assert "connect-src \x27none\x27" in html, "missing connect-src none"
+          assert "worker-src blob:" in html, "missing worker-src blob:"
+          assert "unsafe-inline" not in html, "unsafe-inline forbidden"
+          assert "http://" not in html and "https://" not in html, "external URL found in HTML"
+          print("Static HTML security checks passed.")
+          '
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@983d7736b9b0ae728b81ab4795fac5f72566641b # v5.0.0
+
+      - name: Upload Pages artifact (also usable for external Release signing)
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@56afc609e742023bc8ead0ea2991db7344192b15 # v3.0.3
+        with:
+          path: "./dist"
+
+  deploy:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5c7470f117bc9a96e952775f0a6d0 # v4.0.5

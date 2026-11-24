@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="__CSP__">
+<title>Zero-Trace Wasm PGP Vault</title>
+<style>__INLINE_CSS__</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <h1>Zero-Trace Wasm PGP Vault</h1>
+      <div class="badges">
+        <span id="mode-badge" class="badge">Prüfe Umgebung…</span>
+        <span id="worker-badge" class="badge">Worker startet…</span>
+        <span id="timeout-badge" class="badge">Timeout: --:--</span>
+      </div>
+    </div>
+    <div class="top-actions">
+      <label class="inline-select" for="timeout-select">Inaktivitäts-Wipe
+        <select id="timeout-select" autocomplete="off">
+          <option value="120">2 Min</option>
+          <option value="300" selected>5 Min</option>
+          <option value="900">15 Min</option>
+        </select>
+      </label>
+      <label class="inline-check">
+        <input type="checkbox" id="wipe-on-hide"> Bei Tab-Wechsel löschen
+      </label>
+      <button type="button" id="btn-abort" class="btn btn-warn" hidden>Vorgang abbrechen</button>
+      <button type="button" id="btn-wipe" class="btn btn-danger">NOTFALL-WIPE</button>
+    </div>
+  </header>
+
+  <section id="trust-banner" class="banner" role="region" aria-label="Sicherheitshinweis">
+    <p id="trust-text"></p>
+    <p class="muted small">
+      <strong>Zero Trace</strong> ist das Ziel der appseitigen Spurenminimierung: keine Speicherung in Browser-Speichern, Cookies oder Caches; kontrollierte Puffer werden überschrieben. Browser, Betriebssystem, Auslagerungsspeicher, Absturzabbilder, Erweiterungen und die Zwischenablage können dennoch Spuren behalten. Downloads erfolgen nur auf ausdrückliche Aktion.
+      <span class="mono">Wasm-Build-Kennung (SHA-256): __WASM_SHA256__</span>
+    </p>
+  </section>
+
+  <section id="env-error" class="banner banner-error" hidden></section>
+  <div id="status-bar" class="status-bar" role="status" aria-live="polite"></div>
+
+  <div class="layout">
+    <aside class="panel keyring-panel">
+      <div class="panel-head">
+        <h2>Sitzungs-Schlüsselbund</h2>
+        <span id="key-count" class="badge">0 Schlüssel</span>
+      </div>
+      <p class="muted small">Nur im Arbeitsspeicher des Workers. Bei Wipe oder Schließen verworfen.</p>
+
+      <details id="import-details" open>
+        <summary>Schlüssel importieren (Public / Secret)</summary>
+        <div class="stack">
+          <textarea id="import-text" rows="4" placeholder="-----BEGIN PGP PUBLIC/PRIVATE KEY BLOCK-----" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+          <div class="row">
+            <input type="file" id="import-file" accept=".asc,.pgp,.gpg,.key,.txt">
+            <button type="button" id="btn-import" class="btn btn-primary">Importieren</button>
+          </div>
+        </div>
+      </details>
+
+      <div id="key-list" class="key-list">
+        <p class="muted small">Noch keine Schlüssel geladen.</p>
+      </div>
+    </aside>
+
+    <main class="panel workspace-panel">
+      <nav class="tabs" role="tablist">
+        <button type="button" class="tab active" data-tab="encrypt" role="tab" aria-selected="true">Verschlüsseln</button>
+        <button type="button" class="tab" data-tab="decrypt" role="tab" aria-selected="false">Entschlüsseln</button>
+        <button type="button" class="tab" data-tab="sign" role="tab" aria-selected="false">Signieren</button>
+        <button type="button" class="tab" data-tab="verify" role="tab" aria-selected="false">Verifizieren</button>
+        <button type="button" class="tab" data-tab="keygen" role="tab" aria-selected="false">Schlüssel erzeugen</button>
+      </nav>
+
+      <!-- ENCRYPT -->
+      <section id="tab-encrypt" class="tab-pane active">
+        <div class="stack">
+          <div class="field">
+            <label>Empfänger (Fingerprints vor Verschlüsselung prüfen)</label>
+            <div id="enc-recipients" class="check-list">
+              <span class="muted small">Importieren oder erzeugen Sie mindestens einen Schlüssel.</span>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="field">
+              <label for="enc-profile">Schreibprofil</label>
+              <select id="enc-profile" autocomplete="off">
+                <option value="rfc9580" selected>RFC 9580 (v2-SEIPD + AES-256 + AEAD-OCB + anonyme v6-PKESK)</option>
+                <option value="compat_seipd_v1">Kompatibilität (v1-SEIPD + MDC + AES-256 + anonyme v3-PKESK)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="enc-signer">Optional signieren mit</label>
+              <select id="enc-signer" autocomplete="off">
+                <option value="">— Nicht signieren —</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="enc-sign-pw-row" class="field" hidden>
+            <label for="enc-sign-pw">Passphrase für Signaturschlüssel (wird sofort nach Start geleert)</label>
+            <input type="password" id="enc-sign-pw" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+          </div>
+
+          <div class="field">
+            <label for="enc-text">Klartext-Eingabe (oder Datei wählen; max. 16 MiB)</label>
+            <textarea id="enc-text" rows="5" placeholder="Nachricht eingeben…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+            <div class="row">
+              <input type="file" id="enc-file">
+              <label class="inline-check"><input type="checkbox" id="enc-armor" checked> ASCII Armor (ohne Version/Comment)</label>
+            </div>
+          </div>
+
+          <div class="row">
+            <button type="button" id="btn-encrypt" class="btn btn-primary">Verschlüsseln</button>
+          </div>
+
+          <div id="enc-result" class="result-box" hidden>
+            <div class="result-head">
+              <strong>Verschlüsselte Ausgabe</strong>
+              <span id="enc-audit-badge" class="badge badge-ok"></span>
+            </div>
+            <textarea id="enc-output" rows="6" readonly autocomplete="off" spellcheck="false"></textarea>
+            <div class="row">
+              <button type="button" id="btn-enc-copy" class="btn">Kopieren (explizit)</button>
+              <button type="button" id="btn-enc-download" class="btn">Herunterladen (neutraler Name)</button>
+              <button type="button" id="btn-enc-clear" class="btn">Ausgabe leeren</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- DECRYPT -->
+      <section id="tab-decrypt" class="tab-pane" hidden>
+        <div class="stack">
+          <div class="field">
+            <label for="dec-text">Verschlüsselte Nachricht (ASCII Armor oder Datei; max. 16 MiB)</label>
+            <textarea id="dec-text" rows="6" placeholder="-----BEGIN PGP MESSAGE-----" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+            <div class="row">
+              <input type="file" id="dec-file" accept=".asc,.pgp,.gpg,.bin">
+              <label class="inline-check">
+                <input type="checkbox" id="dec-allow-v1"> Älteres v1-SEIPD+MDC-Leseprofil ausdrücklich erlauben
+              </label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="dec-pw">Passphrase für geladenen geheimen Schlüssel (wird sofort nach Start geleert)</label>
+            <input type="password" id="dec-pw" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+          </div>
+
+          <div class="row">
+            <button type="button" id="btn-decrypt" class="btn btn-primary">Entschlüsseln &amp; Integrität prüfen</button>
+          </div>
+
+          <div id="dec-result" class="result-box" hidden>
+            <div class="result-head">
+              <strong>Entschlüsselter Klartext (Integrität bestätigt)</strong>
+              <span id="dec-autoclear" class="badge badge-warn"></span>
+            </div>
+            <div id="dec-meta" class="meta-grid"></div>
+            <div id="dec-sig-box" class="sig-box"></div>
+            <textarea id="dec-output" rows="6" readonly autocomplete="off" spellcheck="false"></textarea>
+            <div class="row">
+              <button type="button" id="btn-dec-copy" class="btn">Klartext kopieren (explizit)</button>
+              <button type="button" id="btn-dec-download" class="btn">Als Datei laden (vault-plaintext.bin)</button>
+              <button type="button" id="btn-dec-clear" class="btn btn-danger">Klartext jetzt leeren</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SIGN -->
+      <section id="tab-sign" class="tab-pane" hidden>
+        <div class="stack">
+          <div class="grid-2">
+            <div class="field">
+              <label for="sign-key">Signaturschlüssel</label>
+              <select id="sign-key" autocomplete="off">
+                <option value="">— Schlüssel wählen —</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="sign-pw">Passphrase (wird sofort geleert)</label>
+              <input type="password" id="sign-pw" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="sign-text">Text oder Datei zum Signieren (abgetrennte Signatur)</label>
+            <textarea id="sign-text" rows="5" placeholder="Zu signierender Text…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+            <div class="row">
+              <input type="file" id="sign-file">
+              <label class="inline-check"><input type="checkbox" id="sign-armor" checked> ASCII Armor</label>
+            </div>
+          </div>
+
+          <div class="row">
+            <button type="button" id="btn-sign" class="btn btn-primary">Abgetrennte Signatur erzeugen</button>
+          </div>
+
+          <div id="sign-result" class="result-box" hidden>
+            <div class="result-head"><strong>Abgetrennte Signatur</strong></div>
+            <textarea id="sign-output" rows="6" readonly autocomplete="off" spellcheck="false"></textarea>
+            <div class="row">
+              <button type="button" id="btn-sign-copy" class="btn">Kopieren (explizit)</button>
+              <button type="button" id="btn-sign-download" class="btn">Herunterladen (vault-signature.asc)</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- VERIFY -->
+      <section id="tab-verify" class="tab-pane" hidden>
+        <div class="stack">
+          <div class="field">
+            <label for="ver-text">Signierte Daten (Text oder Datei)</label>
+            <textarea id="ver-text" rows="4" placeholder="Originaltext…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+            <input type="file" id="ver-file">
+          </div>
+
+          <div class="field">
+            <label for="ver-sig-text">Abgetrennte Signatur (Armor oder Datei)</label>
+            <textarea id="ver-sig-text" rows="5" placeholder="-----BEGIN PGP SIGNATURE-----" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+            <input type="file" id="ver-sig-file" accept=".asc,.sig,.pgp,.gpg">
+          </div>
+
+          <div class="row">
+            <button type="button" id="btn-verify" class="btn btn-primary">Signatur prüfen</button>
+          </div>
+
+          <div id="ver-result" class="result-box" hidden>
+            <div id="ver-sig-box" class="sig-box"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- KEYGEN -->
+      <section id="tab-keygen" class="tab-pane" hidden>
+        <div class="stack">
+          <p class="muted small">
+            Erzeugt einen RFC-9580-v6-Schlüssel: Primärschlüssel <strong>Ed25519</strong> (Zertifizieren + Signieren) und Unterschlüssel <strong>X25519</strong> (Verschlüsseln). Privater Schlüssel wird ausschließlich passphrasengeschützt (Argon2 + AES-256-OCB) exportiert.
+          </p>
+          <div class="field">
+            <label for="kg-uid">Optionale User-ID (Pseudonym zulässig, darf für v6 leer bleiben)</label>
+            <input type="text" id="kg-uid" placeholder="z. B. pseudonym-01" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="kg-pw">Passphrase (Pflicht, mind. 8 Zeichen, 12+ empfohlen)</label>
+              <input type="password" id="kg-pw" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="kg-pw2">Passphrase wiederholen</label>
+              <input type="password" id="kg-pw2" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+            </div>
+          </div>
+          <div class="row">
+            <button type="button" id="btn-keygen" class="btn btn-primary">RFC-9580-v6-Schlüssel erzeugen</button>
+          </div>
+
+          <div id="kg-result" class="result-box" hidden>
+            <div class="result-head">
+              <strong>Neuer Schlüssel erzeugt</strong>
+              <span id="kg-fp" class="mono small"></span>
+            </div>
+            <div class="grid-2">
+              <div class="stack">
+                <label>Öffentlicher Schlüssel</label>
+                <textarea id="kg-pub" rows="6" readonly autocomplete="off" spellcheck="false"></textarea>
+                <div class="row">
+                  <button type="button" id="btn-kg-pub-copy" class="btn">Public kopieren</button>
+                  <button type="button" id="btn-kg-pub-dl" class="btn">vault-public-key.asc</button>
+                </div>
+              </div>
+              <div class="stack">
+                <label>Geheimer Schlüssel (passphrasengeschützt)</label>
+                <textarea id="kg-sec" rows="6" readonly autocomplete="off" spellcheck="false"></textarea>
+                <div class="row">
+                  <button type="button" id="btn-kg-sec-copy" class="btn">Secret kopieren</button>
+                  <button type="button" id="btn-kg-sec-dl" class="btn">vault-secret-key.asc</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<script>__INLINE_JS__</script>
+</body>
+</html>

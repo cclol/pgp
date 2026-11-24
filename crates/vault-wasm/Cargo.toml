@@ -1,0 +1,22 @@
+[package]
+name = "vault-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pgp = { version = "=0.21.1", default-features = false }
+zeroize = { version = "=1.8.2", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+hex = "=0.4.3"
+base64 = "=0.22.1"
+rand = { version = "=0.8.8", default-features = false }
+getrandom = { version = "=0.3.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "=0.3.4" }
+getrandom02 = { package = "getrandom", version = "=0.2.17", features = ["custom"] }
