@@ -33,7 +33,7 @@ pub fn estimate_pkesk_decrypt_budget(
         .fold(0usize, |acc, n| acc.saturating_add(n));
 
     for pkt_res in PacketParser::new(raw_bytes) {
-        let pkt = pkt_res.map_err(|e| format!("PKESK-Budget-Prüfung fehlgeschlagen: {e}"))?;
+        let pkt = pkt_res.map_err(|e| format!("PKESK budget check failed: {e}"))?;
         if let Packet::PublicKeyEncryptedSessionKey(pkesk) = pkt {
             total_pkesk_count = total_pkesk_count.saturating_add(1);
             let is_anon = match &pkesk {
@@ -78,6 +78,7 @@ pub struct PacketAudit {
     pub pkesk_count: usize,
     pub all_pkesk_anonymous: bool,
     pub pkesk_versions: Vec<u8>,
+    pub seipd_count: usize,
     pub seipd_version: Option<u8>,
     pub has_unauthenticated_sed: bool,
     pub armor_has_version_or_comment: bool,
@@ -104,11 +105,12 @@ pub fn audit_message_packets(raw_bytes: &[u8], armored_text: Option<&str>) -> Re
     let mut pkesk_count = 0usize;
     let mut all_pkesk_anonymous = true;
     let mut pkesk_versions = Vec::new();
+    let mut seipd_count = 0usize;
     let mut seipd_version = None;
     let mut has_unauthenticated_sed = false;
 
     for pkt_res in PacketParser::new(raw_bytes) {
-        let pkt = pkt_res.map_err(|e| format!("Paket-Audit fehlgeschlagen: {e}"))?;
+        let pkt = pkt_res.map_err(|e| format!("Packet audit failed: {e}"))?;
         match pkt {
             Packet::PublicKeyEncryptedSessionKey(pkesk) => {
                 pkesk_count += 1;
@@ -131,7 +133,10 @@ pub fn audit_message_packets(raw_bytes: &[u8], armored_text: Option<&str>) -> Re
                 }
             }
             Packet::SymEncryptedProtectedData(seipd) => {
-                seipd_version = Some(seipd.version() as u8);
+                seipd_count += 1;
+                if seipd_version.is_none() {
+                    seipd_version = Some(seipd.version() as u8);
+                }
             }
             Packet::SymEncryptedData(_) => {
                 has_unauthenticated_sed = true;
@@ -146,6 +151,7 @@ pub fn audit_message_packets(raw_bytes: &[u8], armored_text: Option<&str>) -> Re
         pkesk_count,
         all_pkesk_anonymous,
         pkesk_versions,
+        seipd_count,
         seipd_version,
         has_unauthenticated_sed,
         armor_has_version_or_comment,

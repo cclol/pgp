@@ -120,12 +120,12 @@ impl SessionStore {
             found = true;
         }
         if !found {
-            return Err("Schlüssel mit diesem Fingerprint nicht in der Sitzung gefunden.".into());
+            return Err("Key with this fingerprint was not found in the session.".into());
         }
         self.list_keys()
             .into_iter()
             .find(|k| k.fingerprint == norm)
-            .ok_or_else(|| "Schlüssel nicht gefunden.".into())
+            .ok_or_else(|| "Key not found.".into())
     }
 
     pub fn remove_key(&mut self, fp: &str) -> bool {
@@ -144,7 +144,11 @@ impl SessionStore {
                     .secret_keys
                     .iter()
                     .any(|sk| sk.fingerprint == pk.fingerprint);
-                let can_encrypt = !pk.key.public_subkeys.is_empty()
+                let can_encrypt = pk
+                    .key
+                    .public_subkeys
+                    .iter()
+                    .any(|s| s.key.algorithm().can_encrypt())
                     || pk.key.primary_key.algorithm().can_encrypt();
                 let can_sign = pk.key.primary_key.algorithm().can_sign()
                     || pk

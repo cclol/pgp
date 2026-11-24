@@ -23,10 +23,14 @@ use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::key_select::{select_encryption_target, select_signing_target, EncTarget, SignTarget};
+use crate::key_select::{
+    is_signature_active, select_encryption_target, select_signing_target, select_verifying_keys,
+    EncTarget, SignTarget, VerifyTarget,
+};
 use crate::limits::{
-    check_input_size, check_s2k_params, inspect_raw_packets, read_all_with_limits,
-    MAX_ANON_DECRYPT_ATTEMPTS, MAX_KEYS_PER_IMPORT, MAX_RECIPIENTS,
+    check_base64_input_size, check_input_size, check_s2k_params, inspect_raw_packets,
+    read_all_with_limits, MAX_ANON_DECRYPT_ATTEMPTS, MAX_KEYS_PER_IMPORT, MAX_RECIPIENTS,
+    MAX_TOTAL_DECRYPT_ATTEMPTS,
 };
 use crate::packet_check::{audit_message_packets, estimate_pkesk_decrypt_budget, PacketAudit};
 use crate::session::{KeySummary, SessionStore};
@@ -125,6 +129,7 @@ pub struct DecryptRequest {
     pub input_b64: String,
     pub passphrase: Option<String>,
     pub allow_legacy_seipd_v1: bool,
+    pub now_secs: u32,
 }
 
 #[derive(Serialize)]
@@ -166,21 +171,22 @@ pub struct SignDetachedResponse {
 pub struct VerifyDetachedRequest {
     pub data_b64: String,
     pub signature_b64: String,
+    pub now_secs: u32,
 }
 
 fn build_subpackets(signer: &dyn SigningKey, now_secs: u32) -> Result<SubpacketConfig, String> {
     let ts = Timestamp::from_secs(now_secs);
     let hashed = vec![
         Subpacket::regular(SubpacketData::IssuerFingerprint(signer.fingerprint()))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::SignatureCreationTime(ts))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
     ];
     let mut unhashed = Vec::new();
     if signer.version() <= KeyVersion::V4 {
         unhashed.push(
             Subpacket::regular(SubpacketData::IssuerKeyId(signer.legacy_key_id()))
-                .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+                .map_err(|e| format!("Subpacket error: {e}"))?,
         );
     }
     Ok(SubpacketConfig::UserDefined { hashed, unhashed })
@@ -211,12 +217,12 @@ fn dearmor_to_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut dearmor = Dearmor::with_options(BufReader::new(Cursor::new(bytes)), DearmorOptions::default());
     dearmor
         .read_header()
-        .map_err(|e| format!("ASCII-Armor-Header ungültig: {e}"))?;
+        .map_err(|e| format!("Invalid ASCII Armor header: {e}"))?;
     let mut raw = Vec::new();
     dearmor
         .read_to_end(&mut raw)
-        .map_err(|e| format!("ASCII-Armor-Dekodierung fehlgeschlagen: {e}"))?;
-    check_input_size(raw.len(), "Dekodierte OpenPGP-Daten")?;
+        .map_err(|e| format!("ASCII Armor decoding failed: {e}"))?;
+    check_input_size(raw.len(), "Decoded OpenPGP data")?;
     Ok(raw)
 }
 
@@ -224,7 +230,7 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
     let passphrase = Zeroizing::new(req.passphrase);
     if passphrase.len() < 8 {
         return Err(
-            "Passphrase ist zwingend erforderlich (mindestens 8 Zeichen; 12+ Zeichen empfohlen)."
+            "Passphrase is required (minimum 8 characters; 12+ characters recommended)."
                 .into(),
         );
     }
@@ -236,7 +242,7 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
     // 1. Generate RFC 9580 v6 Primary Key (Ed25519)
     let (pub_params, sec_params_raw) = KeyType::Ed25519
         .generate(&mut rng)
-        .map_err(|e| format!("Ed25519-Schlüsselerzeugung fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Ed25519 key generation failed: {e}"))?;
     let primary_pub_inner = PubKeyInner::new(
         KeyVersion::V6,
         KeyType::Ed25519.to_alg(),
@@ -244,9 +250,9 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         None,
         pub_params,
     )
-    .map_err(|e| format!("Primärschlüssel-Header fehlgeschlagen: {e}"))?;
+    .map_err(|e| format!("Primary key header creation failed: {e}"))?;
     let primary_pub_pkt = PacketPublicKey::from_inner(primary_pub_inner)
-        .map_err(|e| format!("Primärschlüssel-Public-Paket fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Primary public key packet failed: {e}"))?;
     let primary_s2k = S2kParams::new_default(&mut rng, KeyVersion::V6);
     let primary_sec_params = match &sec_params_raw {
         SecretParams::Plain(plain) => SecretParams::Encrypted(
@@ -257,12 +263,12 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
                     &primary_pub_pkt,
                     Some(Tag::SecretKey),
                 )
-                .map_err(|e| format!("Primärschlüssel-Verschlüsselung fehlgeschlagen: {e}"))?,
+                .map_err(|e| format!("Primary key encryption failed: {e}"))?,
         ),
         other => other.clone(),
     };
     let primary_key = PacketSecretKey::new(primary_pub_pkt.clone(), primary_sec_params)
-        .map_err(|e| format!("Primärschlüssel-Paket fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Primary secret key packet failed: {e}"))?;
 
     // 2. Direct Key Signature (RFC 9580 v6) using explicit `created` timestamp (no SystemTime::now!)
     let mut keyflags = KeyFlags::default();
@@ -279,30 +285,30 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         primary_key.algorithm(),
         HashAlgorithm::Sha256,
     )
-    .map_err(|e| format!("Direct-Key-Signatur-Konfiguration fehlgeschlagen: {e}"))?;
+    .map_err(|e| format!("Direct key signature configuration failed: {e}"))?;
     dks_cfg.hashed_subpackets = vec![
         Subpacket::regular(SubpacketData::SignatureCreationTime(created))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::IssuerFingerprint(primary_key.fingerprint()))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::KeyFlags(keyflags))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::Features(features))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::PreferredSymmetricAlgorithms(
             [SymmetricKeyAlgorithm::AES256].into_iter().collect(),
         ))
-        .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+        .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::PreferredHashAlgorithms(
             [HashAlgorithm::Sha256, HashAlgorithm::Sha512]
                 .into_iter()
                 .collect(),
         ))
-        .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+        .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::PreferredCompressionAlgorithms(
             [CompressionAlgorithm::Uncompressed].into_iter().collect(),
         ))
-        .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+        .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::PreferredAeadAlgorithms(
             [
                 (SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb),
@@ -311,12 +317,12 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
             .into_iter()
             .collect(),
         ))
-        .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+        .map_err(|e| format!("Subpacket error: {e}"))?,
     ];
     let primary_pub_pkt = primary_key.public_key();
     let dks = dks_cfg
         .sign_key(&primary_key, &pw, &primary_pub_pkt)
-        .map_err(|e| format!("Direct-Key-Signatur fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Direct key signature failed: {e}"))?;
 
     // 3. Optional User ID with explicit timestamp self-signature
     let mut users = Vec::new();
@@ -324,25 +330,25 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         let trimmed = uid_str.trim();
         if !trimmed.is_empty() {
             let uid = UserId::from_str(PacketHeaderVersion::New, trimmed)
-                .map_err(|e| format!("Ungültige User-ID: {e}"))?;
+                .map_err(|e| format!("Invalid User ID: {e}"))?;
             let mut uid_cfg = SignatureConfig::v6(
                 &mut rng,
                 SignatureType::CertPositive,
                 primary_key.algorithm(),
                 HashAlgorithm::Sha256,
             )
-            .map_err(|e| format!("User-ID-Signatur-Konfiguration fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("User ID signature configuration failed: {e}"))?;
             uid_cfg.hashed_subpackets = vec![
                 Subpacket::regular(SubpacketData::SignatureCreationTime(created))
-                    .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+                    .map_err(|e| format!("Subpacket error: {e}"))?,
                 Subpacket::regular(SubpacketData::IssuerFingerprint(primary_key.fingerprint()))
-                    .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+                    .map_err(|e| format!("Subpacket error: {e}"))?,
                 Subpacket::regular(SubpacketData::IsPrimary(true))
-                    .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+                    .map_err(|e| format!("Subpacket error: {e}"))?,
             ];
             let uid_sig = uid_cfg
                 .sign_certification(&primary_key, &primary_pub_pkt, &pw, uid.tag(), &uid)
-                .map_err(|e| format!("User-ID-Signatur fehlgeschlagen: {e}"))?;
+                .map_err(|e| format!("User ID certification signature failed: {e}"))?;
             users.push(SignedUser::new(uid, vec![uid_sig]));
         }
     }
@@ -350,7 +356,7 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
     // 4. Generate RFC 9580 v6 Encryption Subkey (X25519) + Binding Signature
     let (sub_pub_params, sub_sec_raw) = KeyType::X25519
         .generate(&mut rng)
-        .map_err(|e| format!("X25519-Subkey-Erzeugung fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("X25519 subkey generation failed: {e}"))?;
     let sub_pub_inner = PubKeyInner::new(
         KeyVersion::V6,
         KeyType::X25519.to_alg(),
@@ -358,9 +364,9 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         None,
         sub_pub_params,
     )
-    .map_err(|e| format!("Subkey-Header fehlgeschlagen: {e}"))?;
+    .map_err(|e| format!("Subkey header creation failed: {e}"))?;
     let sub_pub_pkt = PacketPublicSubkey::from_inner(sub_pub_inner)
-        .map_err(|e| format!("Subkey-Public-Paket fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Subkey public packet failed: {e}"))?;
     let sub_s2k = S2kParams::new_default(&mut rng, KeyVersion::V6);
     let sub_sec_params = match &sub_sec_raw {
         SecretParams::Plain(plain) => SecretParams::Encrypted(
@@ -371,12 +377,12 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
                     &sub_pub_pkt,
                     Some(Tag::SecretSubkey),
                 )
-                .map_err(|e| format!("Subkey-Verschlüsselung fehlgeschlagen: {e}"))?,
+                .map_err(|e| format!("Subkey encryption failed: {e}"))?,
         ),
         other => other.clone(),
     };
     let sub_key = PacketSecretSubkey::new(sub_pub_pkt, sub_sec_params)
-        .map_err(|e| format!("Subkey-Paket fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Subkey secret packet failed: {e}"))?;
 
     let mut sub_flags = KeyFlags::default();
     sub_flags.set_encrypt_comms(true);
@@ -388,18 +394,18 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         primary_key.algorithm(),
         HashAlgorithm::Sha256,
     )
-    .map_err(|e| format!("Subkey-Binding-Konfiguration fehlgeschlagen: {e}"))?;
+    .map_err(|e| format!("Subkey binding configuration failed: {e}"))?;
     sub_cfg.hashed_subpackets = vec![
         Subpacket::regular(SubpacketData::SignatureCreationTime(created))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::IssuerFingerprint(primary_key.fingerprint()))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
         Subpacket::regular(SubpacketData::KeyFlags(sub_flags))
-            .map_err(|e| format!("Subpacket-Fehler: {e}"))?,
+            .map_err(|e| format!("Subpacket error: {e}"))?,
     ];
     let sub_binding = sub_cfg
         .sign_subkey_binding(&primary_key, &primary_pub_pkt, &pw, &sub_key.public_key())
-        .map_err(|e| format!("Subkey-Binding-Signatur fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Subkey binding signature failed: {e}"))?;
 
     let details = SignedKeyDetails::new(vec![], vec![dks], users, vec![]);
     let secret_key = SignedSecretKey::new(
@@ -412,18 +418,18 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
     // Verify self-signatures immediately
     secret_key
         .verify_bindings()
-        .map_err(|e| format!("Selbstsignatur-Prüfung fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Self-signature verification failed: {e}"))?;
 
     let public_key = secret_key.to_public_key();
     let armor_opts = ArmorOptions::default(); // headers: None (no Version/Comment)
 
     let public_key_armored = public_key
         .to_armored_string(armor_opts.clone())
-        .map_err(|e| format!("Public-Key-Export fehlgeschlagen: {e}"))?;
+        .map_err(|e| format!("Public key export failed: {e}"))?;
     let secret_key_armored = Zeroizing::new(
         secret_key
             .to_armored_string(armor_opts)
-            .map_err(|e| format!("Secret-Key-Export fehlgeschlagen: {e}"))?,
+            .map_err(|e| format!("Secret key export failed: {e}"))?,
     );
 
     // Self-generated key is confirmed by the user in this session
@@ -438,11 +444,12 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
 }
 
 pub fn import_keys(store: &mut SessionStore, req: ImportKeyRequest) -> Result<ImportKeyResponse, String> {
+    check_base64_input_size(req.data_b64.len(), "Key import")?;
     let raw_input = Zeroizing::new(
         B64.decode(req.data_b64.as_bytes())
-            .map_err(|e| format!("Ungültige Base64-Eingabe: {e}"))?,
+            .map_err(|e| format!("Invalid Base64 input: {e}"))?,
     );
-    check_input_size(raw_input.len(), "Schlüsselimport")?;
+    check_input_size(raw_input.len(), "Key import")?;
 
     let binary_bytes = if is_ascii_armored(&raw_input) {
         Zeroizing::new(dearmor_to_bytes(&raw_input)?)
@@ -462,12 +469,12 @@ pub fn import_keys(store: &mut SessionStore, req: ImportKeyRequest) -> Result<Im
                 count += 1;
                 if count > MAX_KEYS_PER_IMPORT {
                     return Err(format!(
-                        "Schlüsselimport überschreitet Limit von {MAX_KEYS_PER_IMPORT} Schlüsseln."
+                        "Key import exceeds the limit of {MAX_KEYS_PER_IMPORT} keys."
                     ));
                 }
                 check_secret_key_s2k(&sk)?;
                 sk.verify_bindings()
-                    .map_err(|e| format!("Schlüssel-Selbstsignatur ungültig: {e}"))?;
+                    .map_err(|e| format!("Invalid key self-signature: {e}"))?;
                 imported.push(store.upsert_secret(sk, false));
             }
         }
@@ -476,48 +483,49 @@ pub fn import_keys(store: &mut SessionStore, req: ImportKeyRequest) -> Result<Im
     // If no secret keys parsed, try public keys
     if imported.is_empty() {
         let iter = SignedPublicKey::from_bytes_many(Cursor::new(binary_bytes.as_slice()))
-            .map_err(|e| format!("Schlüssel konnte nicht geparst werden: {e}"))?;
+            .map_err(|e| format!("Failed to parse key: {e}"))?;
         let mut count = 0usize;
         for item in iter {
-            let pk = item.map_err(|e| format!("Ungültiger öffentlicher Schlüssel: {e}"))?;
+            let pk = item.map_err(|e| format!("Invalid public key: {e}"))?;
             count += 1;
             if count > MAX_KEYS_PER_IMPORT {
                 return Err(format!(
-                    "Schlüsselimport überschreitet Limit von {MAX_KEYS_PER_IMPORT} Schlüsseln."
+                    "Key import exceeds the limit of {MAX_KEYS_PER_IMPORT} keys."
                 ));
             }
             pk.verify_bindings()
-                .map_err(|e| format!("Schlüssel-Selbstsignatur ungültig: {e}"))?;
+                .map_err(|e| format!("Invalid key self-signature: {e}"))?;
             imported.push(store.upsert_public(pk, false));
         }
     }
 
     if imported.is_empty() {
-        return Err("Keine gültigen OpenPGP-Schlüssel in der Eingabe gefunden.".into());
+        return Err("No valid OpenPGP keys found in input.".into());
     }
 
     Ok(ImportKeyResponse { imported })
 }
 
 pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<EncryptResponse, String> {
+    check_base64_input_size(req.plaintext_b64.len(), "Plaintext")?;
     let plaintext = Zeroizing::new(
         B64.decode(req.plaintext_b64.as_bytes())
-            .map_err(|e| format!("Ungültige Base64-Klartexteingabe: {e}"))?,
+            .map_err(|e| format!("Invalid Base64 plaintext input: {e}"))?,
     );
-    check_input_size(plaintext.len(), "Klartext")?;
+    check_input_size(plaintext.len(), "Plaintext")?;
 
     if req.recipient_fingerprints.is_empty() {
-        return Err("Mindestens ein Empfänger-Schlüssel muss ausgewählt werden.".into());
+        return Err("At least one recipient key must be selected.".into());
     }
     if req.recipient_fingerprints.len() > MAX_RECIPIENTS {
         return Err(format!(
-            "Zu viele Empfänger (max {MAX_RECIPIENTS})."
+            "Too many recipients (max {MAX_RECIPIENTS})."
         ));
     }
 
     let profile = req.profile.as_deref().unwrap_or("rfc9580");
     if profile != "rfc9580" && profile != "compat_seipd_v1" {
-        return Err(format!("Unbekanntes Verschlüsselungsprofil: {profile}"));
+        return Err(format!("Unknown encryption profile: {profile}"));
     }
 
     let mut recipients = Vec::with_capacity(req.recipient_fingerprints.len());
@@ -527,7 +535,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
             .public_keys
             .iter()
             .find(|k| k.fingerprint == norm)
-            .ok_or_else(|| format!("Empfänger-Schlüssel {norm} nicht in der Sitzung gefunden."))?;
+            .ok_or_else(|| format!("Recipient key {norm} was not found in the session."))?;
         let enc_key = select_encryption_target(&stored.key, req.now_secs)?;
         recipients.push(enc_key);
     }
@@ -543,7 +551,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
                 .secret_keys
                 .iter()
                 .find(|k| k.fingerprint == norm)
-                .ok_or_else(|| format!("Signaturschlüssel {norm} nicht in der Sitzung gefunden."))?;
+                .ok_or_else(|| format!("Signing key {norm} was not found in the session."))?;
             check_secret_key_s2k(&stored.key)?;
             let signing_key: &dyn SigningKey = match select_signing_target(&stored.key, req.now_secs)? {
                 SignTarget::Primary(k) => k,
@@ -572,7 +580,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
             };
             res.map_err(|e| {
                 format!(
-                    "RFC-9580-Verschlüsselung (v2-SEIPD/v6-PKESK) für Empfänger fehlgeschlagen (kein stiller Fallback): {e}"
+                    "RFC 9580 encryption (v2-SEIPD/v6-PKESK) failed for recipient (no silent fallback): {e}"
                 )
             })?;
         }
@@ -583,7 +591,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
         }
         builder
             .to_vec(&mut rng)
-            .map_err(|e| format!("Verschlüsselung (RFC 9580) fehlgeschlagen: {e}"))?
+            .map_err(|e| format!("Encryption (RFC 9580) failed: {e}"))?
     } else {
         let mut builder = MessageBuilder::from_bytes("", plaintext.as_slice().to_vec())
             .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
@@ -594,7 +602,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
             };
             res.map_err(|e| {
                 format!(
-                    "Kompatibilitäts-Verschlüsselung (v1-SEIPD/v3-PKESK) fehlgeschlagen: {e}"
+                    "Compatibility encryption (v1-SEIPD/v3-PKESK) failed: {e}"
                 )
             })?;
         }
@@ -605,7 +613,7 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
         }
         builder
             .to_vec(&mut rng)
-            .map_err(|e| format!("Verschlüsselung (v1-SEIPD) fehlgeschlagen: {e}"))?
+            .map_err(|e| format!("Encryption (v1-SEIPD) failed: {e}"))?
     };
 
     let output_armored = if req.armor {
@@ -617,8 +625,8 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
             None, // NO Version / Comment headers!
             true,
         )
-        .map_err(|e| format!("ASCII-Armor-Ausgabe fehlgeschlagen: {e}"))?;
-        Some(String::from_utf8(out).map_err(|e| format!("UTF-8-Fehler: {e}"))?)
+        .map_err(|e| format!("ASCII Armor encoding failed: {e}"))?;
+        Some(String::from_utf8(out).map_err(|e| format!("UTF-8 error: {e}"))?)
     } else {
         None
     };
@@ -626,13 +634,13 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
     // Directly audit serialized packets before returning!
     let packet_audit = audit_message_packets(&raw_output, output_armored.as_deref())?;
     if !packet_audit.all_pkesk_anonymous {
-        return Err("Interner Sicherheitsfehler: Nicht-anonymer PKESK erkannt.".into());
+        return Err("Internal security error: non-anonymous PKESK detected.".into());
     }
     if packet_audit.armor_has_version_or_comment {
-        return Err("Interner Sicherheitsfehler: Armor enthält Version/Comment-Header.".into());
+        return Err("Internal security error: ASCII Armor contains Version or Comment header.".into());
     }
     if packet_audit.has_unauthenticated_sed {
-        return Err("Interner Sicherheitsfehler: Unauthentifiziertes SED-Paket erzeugt.".into());
+        return Err("Internal security error: unauthenticated SED packet produced.".into());
     }
 
     let output_b64 = if let Some(ref arm) = output_armored {
@@ -645,9 +653,9 @@ pub fn encrypt_message(store: &SessionStore, req: EncryptRequest) -> Result<Encr
         output_b64,
         output_armored,
         profile_used: if profile == "rfc9580" {
-            "RFC 9580 (v2-SEIPD + AES-256 + AEAD-OCB + anonyme v6-PKESK)".into()
+            "RFC 9580 (v2-SEIPD + AES-256 + AEAD-OCB + anonymous v6-PKESK)".into()
         } else {
-            "Kompatibilität (v1-SEIPD + MDC + AES-256 + anonyme v3-PKESK)".into()
+            "Compatibility (v1-SEIPD + MDC + AES-256 + anonymous v3-PKESK)".into()
         },
         packet_audit,
     })
@@ -666,10 +674,11 @@ impl pgp::ser::Serialize for RawPacketSlice<'_> {
 }
 
 pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<DecryptResponse, String> {
+    check_base64_input_size(req.input_b64.len(), "Encrypted message")?;
     let raw_input = B64
         .decode(req.input_b64.as_bytes())
-        .map_err(|e| format!("Ungültige Base64-Eingabe: {e}"))?;
-    check_input_size(raw_input.len(), "Verschlüsselte Nachricht")?;
+        .map_err(|e| format!("Invalid Base64 input: {e}"))?;
+    check_input_size(raw_input.len(), "Encrypted message")?;
 
     let binary_bytes = if is_ascii_armored(&raw_input) {
         dearmor_to_bytes(&raw_input)?
@@ -682,23 +691,30 @@ pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<Decr
 
     if audit.has_unauthenticated_sed {
         return Err(
-            "Abgelehnt: Unauthentifizierte Nachricht ohne Integritätsschutz (SED / Tag 9).".into(),
+            "Rejected: unauthenticated message without integrity protection (SED / Tag 9).".into(),
         );
     }
 
+    if audit.seipd_count != 1 {
+        return Err(format!(
+            "Rejected: expected exactly 1 integrity-protected SEIPD packet, found {}.",
+            audit.seipd_count
+        ));
+    }
+
     let seipd_version = audit.seipd_version.ok_or_else(|| {
-        "Abgelehnt: Keine integritätsgeschützte SEIPD-Nachricht gefunden.".to_string()
+        "Rejected: no integrity-protected SEIPD message found.".to_string()
     })?;
 
     if seipd_version == 1 && !req.allow_legacy_seipd_v1 {
         return Err(
-            "Abgelehnt: Nachricht nutzt älteres v1-SEIPD+MDC-Format. Aktivieren Sie das explizite v1-Leseprofil, um sie zu entschlüsseln."
+            "Rejected: message uses legacy v1-SEIPD+MDC format. Explicitly enable the v1 read profile to decrypt it."
                 .into(),
         );
     }
 
     if store.secret_keys.is_empty() {
-        return Err("Kein geheimer Schlüssel in der Sitzung geladen.".into());
+        return Err("No secret key is loaded in the session.".into());
     }
 
     let mut sk_refs: Vec<&SignedSecretKey> = Vec::with_capacity(store.secret_keys.len());
@@ -707,16 +723,22 @@ pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<Decr
         sk_refs.push(&stored.key);
     }
 
-    // Enforce conservative upper bound on anonymous PKESK decryption attempts across ALL
+    // Enforce conservative upper bound on anonymous and total PKESK decryption attempts across ALL
     // primary keys + subkeys that rPGP's `TheRing::find_session_key` will consider.
     let budget = estimate_pkesk_decrypt_budget(&binary_bytes, &sk_refs)?;
     if budget.worst_case_anon_attempts > MAX_ANON_DECRYPT_ATTEMPTS {
         return Err(format!(
-            "Anonyme Entschlüsselungsversuche überschreiten Limit ({} > {}: {} anonyme PKESK × {} Kandidaten-Schlüssel inkl. Unterschlüssel). Reduzieren Sie die geladenen Schlüssel oder prüfen Sie die Nachricht.",
+            "Anonymous decryption attempts exceed limit ({} > {}: {} anonymous PKESK × {} candidate keys including subkeys). Reduce loaded keys or inspect the message.",
             budget.worst_case_anon_attempts,
             MAX_ANON_DECRYPT_ATTEMPTS,
             budget.anon_pkesk_count,
             budget.candidate_keys_per_anon_pkesk
+        ));
+    }
+    if budget.worst_case_total_attempts > MAX_TOTAL_DECRYPT_ATTEMPTS {
+        return Err(format!(
+            "Total PKESK decryption attempts exceed limit ({} > {}).",
+            budget.worst_case_total_attempts, MAX_TOTAL_DECRYPT_ATTEMPTS
         ));
     }
 
@@ -724,18 +746,21 @@ pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<Decr
     let pw = Password::from(passphrase.as_str());
 
     let msg = Message::from_bytes(Cursor::new(binary_bytes.as_slice()))
-        .map_err(|e| format!("Nachricht konnte nicht geparst werden: {e}"))?;
+        .map_err(|e| format!("Failed to parse message: {e}"))?;
 
     let mut decrypted = msg
         .decrypt_with_keys(vec![&pw], sk_refs)
-        .map_err(|e| format!("Entschlüsselung fehlgeschlagen (Schlüssel, Passphrase oder Format): {e}"))?;
+        .map_err(|e| format!("Decryption failed (key, passphrase, or format): {e}"))?;
 
     let mut was_compressed = false;
     if matches!(decrypted, Message::Compressed { .. }) {
         was_compressed = true;
         decrypted = decrypted
             .decompress()
-            .map_err(|e| format!("Dekompression fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("Decompression failed: {e}"))?;
+        if matches!(decrypted, Message::Compressed { .. }) {
+            return Err("Rejected: nested compressed packets are not allowed.".into());
+        }
     }
 
     // Read ALL plaintext bytes first so AEAD / MDC integrity verification runs to completion!
@@ -750,8 +775,8 @@ pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<Decr
         None => (String::new(), 0),
     };
 
-    // Inspect & verify inline signatures (if any) against all loaded public keys
-    let signature = verify_inline_signatures(store, &decrypted);
+    // Inspect & verify inline signatures (if any) against validated, eligible verifying keys
+    let signature = verify_inline_signatures(store, &decrypted, req.now_secs);
 
     Ok(DecryptResponse {
         plaintext_b64: B64.encode(plaintext.as_slice()),
@@ -763,7 +788,7 @@ pub fn decrypt_message(store: &SessionStore, req: DecryptRequest) -> Result<Decr
     })
 }
 
-fn verify_inline_signatures(store: &SessionStore, msg: &Message<'_>) -> SignatureInfo {
+fn verify_inline_signatures(store: &SessionStore, msg: &Message<'_>, now_secs: u32) -> SignatureInfo {
     if !matches!(msg, Message::Signed { .. }) {
         return SignatureInfo {
             status: "none".into(),
@@ -775,27 +800,37 @@ fn verify_inline_signatures(store: &SessionStore, msg: &Message<'_>) -> Signatur
     }
 
     for pk in &store.public_keys {
-        // Try primary key and signing subkeys
-        let mut verifiers: Vec<&dyn VerifyingKey> = vec![&pk.key.primary_key];
-        for sub in &pk.key.public_subkeys {
-            verifiers.push(&sub.key);
+        // Only consider validated, non-revoked, non-expired signing-capable keys/subkeys
+        // with explicit Sign Key Flags and valid subkey bindings/backsignatures.
+        let targets = select_verifying_keys(&pk.key, now_secs);
+        if targets.is_empty() {
+            continue;
         }
+        let verifiers: Vec<&dyn VerifyingKey> = targets
+            .iter()
+            .map(|t| match t {
+                VerifyTarget::Primary(k) => *k as &dyn VerifyingKey,
+                VerifyTarget::Subkey(k) => *k as &dyn VerifyingKey,
+            })
+            .collect();
         if let Ok(results) = msg.verify_nested(&verifiers) {
             for res in results {
                 if let pgp::composed::VerificationResult::Valid(sig) = res {
-                    return SignatureInfo {
-                        status: "valid".into(),
-                        signer_fingerprint: Some(pk.fingerprint.clone()),
-                        signer_user_ids: pk.user_ids.clone(),
-                        signer_identity_confirmed: pk.identity_confirmed,
-                        created_at: sig.created().map(|t| t.as_secs()),
-                    };
+                    if is_signature_active(&sig, now_secs) {
+                        return SignatureInfo {
+                            status: "valid".into(),
+                            signer_fingerprint: Some(pk.fingerprint.clone()),
+                            signer_user_ids: pk.user_ids.clone(),
+                            signer_identity_confirmed: pk.identity_confirmed,
+                            created_at: sig.created().map(|t| t.as_secs()),
+                        };
+                    }
                 }
             }
         }
     }
 
-    // Signature present but did not validate against any loaded key
+    // Signature present but did not validate against any eligible loaded key
     SignatureInfo {
         status: if store.public_keys.is_empty() {
             "unknown_signer".into()
@@ -813,18 +848,19 @@ pub fn sign_detached(
     store: &SessionStore,
     req: SignDetachedRequest,
 ) -> Result<SignDetachedResponse, String> {
+    check_base64_input_size(req.data_b64.len(), "Data to sign")?;
     let data = Zeroizing::new(
         B64.decode(req.data_b64.as_bytes())
-            .map_err(|e| format!("Ungültige Base64-Daten: {e}"))?,
+            .map_err(|e| format!("Invalid Base64 data: {e}"))?,
     );
-    check_input_size(data.len(), "Zu signierende Daten")?;
+    check_input_size(data.len(), "Data to sign")?;
 
     let norm = req.sign_fingerprint.trim().to_uppercase();
     let stored = store
         .secret_keys
         .iter()
         .find(|k| k.fingerprint == norm)
-        .ok_or_else(|| format!("Signaturschlüssel {norm} nicht in der Sitzung gefunden."))?;
+        .ok_or_else(|| format!("Signing key {norm} was not found in the session."))?;
     check_secret_key_s2k(&stored.key)?;
 
     let passphrase = Zeroizing::new(req.passphrase);
@@ -857,12 +893,12 @@ pub fn sign_detached(
             )
         }
     }
-    .map_err(|e| format!("Signierung fehlgeschlagen (Passphrase oder Schlüssel): {e}"))?;
+    .map_err(|e| format!("Signing failed (passphrase or key): {e}"))?;
 
     let signature_armored = if req.armor {
         let arm = sig
             .to_armored_string(ArmorOptions::default())
-            .map_err(|e| format!("Armor-Ausgabe fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("ASCII Armor encoding failed: {e}"))?;
         Some(arm)
     } else {
         None
@@ -873,7 +909,7 @@ pub fn sign_detached(
     } else {
         let mut raw = Vec::new();
         pgp::ser::Serialize::to_writer(&sig, &mut raw)
-            .map_err(|e| format!("Signatur-Serialisierung fehlgeschlagen: {e}"))?;
+            .map_err(|e| format!("Signature serialization failed: {e}"))?;
         B64.encode(&raw)
     };
 
@@ -888,15 +924,18 @@ pub fn verify_detached(
     store: &SessionStore,
     req: VerifyDetachedRequest,
 ) -> Result<SignatureInfo, String> {
-    let data = B64
-        .decode(req.data_b64.as_bytes())
-        .map_err(|e| format!("Ungültige Base64-Daten: {e}"))?;
-    check_input_size(data.len(), "Zu prüfende Daten")?;
+    check_base64_input_size(req.data_b64.len(), "Data to verify")?;
+    let data = Zeroizing::new(
+        B64.decode(req.data_b64.as_bytes())
+            .map_err(|e| format!("Invalid Base64 data: {e}"))?,
+    );
+    check_input_size(data.len(), "Data to verify")?;
 
+    check_base64_input_size(req.signature_b64.len(), "Signature")?;
     let sig_raw = B64
         .decode(req.signature_b64.as_bytes())
-        .map_err(|e| format!("Ungültige Base64-Signatur: {e}"))?;
-    check_input_size(sig_raw.len(), "Signatur")?;
+        .map_err(|e| format!("Invalid Base64 signature: {e}"))?;
+    check_input_size(sig_raw.len(), "Signature")?;
 
     let sig_bytes = if is_ascii_armored(&sig_raw) {
         dearmor_to_bytes(&sig_raw)?
@@ -906,7 +945,7 @@ pub fn verify_detached(
     let _tags = inspect_raw_packets(&sig_bytes)?;
 
     let sig = DetachedSignature::from_bytes(Cursor::new(sig_bytes.as_slice()))
-        .map_err(|e| format!("Abgetrennte Signatur ungültig: {e}"))?;
+        .map_err(|e| format!("Invalid detached signature: {e}"))?;
 
     if store.public_keys.is_empty() {
         return Ok(SignatureInfo {
@@ -918,25 +957,22 @@ pub fn verify_detached(
         });
     }
 
-    for pk in &store.public_keys {
-        if sig.verify(&pk.key.primary_key, &data).is_ok() {
-            return Ok(SignatureInfo {
-                status: "valid".into(),
-                signer_fingerprint: Some(pk.fingerprint.clone()),
-                signer_user_ids: pk.user_ids.clone(),
-                signer_identity_confirmed: pk.identity_confirmed,
-                created_at: sig.signature.created().map(|t| t.as_secs()),
-            });
-        }
-        for sub in &pk.key.public_subkeys {
-            if sig.verify(&sub.key, &data).is_ok() {
-                return Ok(SignatureInfo {
-                    status: "valid".into(),
-                    signer_fingerprint: Some(pk.fingerprint.clone()),
-                    signer_user_ids: pk.user_ids.clone(),
-                    signer_identity_confirmed: pk.identity_confirmed,
-                    created_at: sig.signature.created().map(|t| t.as_secs()),
-                });
+    if is_signature_active(&sig.signature, req.now_secs) {
+        for pk in &store.public_keys {
+            for target in select_verifying_keys(&pk.key, req.now_secs) {
+                let verified = match target {
+                    VerifyTarget::Primary(k) => sig.verify(k, data.as_slice()).is_ok(),
+                    VerifyTarget::Subkey(k) => sig.verify(k, data.as_slice()).is_ok(),
+                };
+                if verified {
+                    return Ok(SignatureInfo {
+                        status: "valid".into(),
+                        signer_fingerprint: Some(pk.fingerprint.clone()),
+                        signer_user_ids: pk.user_ids.clone(),
+                        signer_identity_confirmed: pk.identity_confirmed,
+                        created_at: sig.signature.created().map(|t| t.as_secs()),
+                    });
+                }
             }
         }
     }

@@ -1,50 +1,73 @@
-# Abnahmeprotokoll, Sicherheitsnachweise und offene Grenzen
+# Verification Log, Security Review, and Open Boundaries
 
-> **Freigabestatus: TESTVERSION (nicht freigegeben)**  
-> Die sicherheitskritischen Code-Befunde (Schlüsselauswahl, Wipe-Sicherheit bei laufenden Dateioperationen, Budget für anonyme PKESK-Versuche) wurden behoben und durch automatisierte Regressionstests nachgewiesen. Solange die externen Freigabetests (GitHub Pages Live-Start, Tor Browser, GnuPG/Kleopatra-Interoperabilität, externe Release-Signierung und Zwei-Umgebungen-Buildvergleich) offen sind, gilt dieser Stand ausdrücklich als **Testversion**.
+> **Release status: TEST BUILD (not yet released)**
+>
+> All confirmed code-level security findings from both the initial and fresh reviews have been fixed and verified with automated Rust and browser regression tests. Because external release gates (Tor Browser, GnuPG/Kleopatra interoperability, independent two-environment reproducibility check, external detached signature verification, and live Pages deployment of the updated English build) remain open, this build is explicitly marked as a **test build**.
 
-## 1. Gebautes Artefakt (aktueller Stand)
+## 1. Environment & Tool Versions
 
-- **Toolchain:** Rust `1.99.1` (`rust-toolchain.toml`, Target `wasm32-unknown-unknown`)
-- **rPGP:** `pgp = "=0.21.1"` (eingecheckte `Cargo.lock`, gebaut mit `--locked`)
-- **Wasm-Binary (`vault_wasm.wasm`):** `2,614,597` Bytes · SHA-256 `f5a7f75dfdb3787754fba113a947c777d6356e9c00ce3f78d54a50551134c479`
-- **Standalone HTML (`dist/index.html`):** `3,549,731` Bytes · SHA-256 `8dcad2931b1583fdcf8500532291d0639ac3204c9b505c448985ced0abe5f0d7`
+- **OS / Architecture:** macOS (`aarch64-apple-darwin`)
+- **Rust / Cargo:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `cargo 1.99.1 (5f94df478 2026-08-27)` (`rust-toolchain.toml`, target `wasm32-unknown-unknown`)
+- **rPGP:** `pgp = "=0.21.1"` (checked-in `Cargo.lock`, built with `--locked --offline`)
+- **Python:** `Python 3.14.7`
+- **Node.js:** `v20.20.2`
+- **Browsers tested locally:**
+  - **Google Chrome:** `158.0.8127.88`
+  - **Mozilla Firefox:** `158.0.1`
+- **Tools not installed on this host:** `gpg` (GnuPG), `Kleopatra`, `sq` (Sequoia), `Tor Browser`
 
-## 2. Behobene Sicherheitsbefunde und Regressionstests
+## 2. Built Local Artifact (Current Workspace)
 
-| Befund | Reproduktion & Ursache | Behebung | Regressionstest |
+- **Wasm binary (`target/wasm32-unknown-unknown/release/vault_wasm.wasm`):** `2,618,240` bytes · SHA-256 `8bd3157bcfd78f2079863ea3515dc32181e818be3486276b50d75646173fa7ec`
+- **Standalone HTML (`dist/index.html`):** `3,555,293` bytes · SHA-256 `18745f7af62ee3d9f3cb136a47038517e564e2705e72b4acad36e2646237ba00`
+- **CSP hashes embedded in `dist/index.html`:**
+  - `style-src 'sha256-rqK/7OxggKjW+nXJM44BSaAudDQnfCdiXxr/yb6Vs0k='`
+  - `script-src 'sha256-ukjQbownz3F/TMCpZR6BMMv2T82bAlZTwE81oTCg+i4=' 'wasm-unsafe-eval'`
+  - `worker-src blob:`
+
+## 3. Confirmed Security Findings Fixed & Regression Tests
+
+### Previous Findings (Re-verified)
+
+| Finding | Cause | Fix | Regression Test |
 |---|---|---|---|
-| **1. OpenPGP-Schlüsselauswahl** | `select_encryption_subkey` und `select_signing_key` prüften nur `algorithm().can_encrypt()/can_sign()`; `sign_detached` nutzte fest `primary_key` ohne Prüfung auf Widerruf, Ablauf, Bindungssignaturen oder Key Flags. | Neues Modul `crates/vault-wasm/src/key_select.rs`: prüft Primärschlüssel-Selbstsignaturen, `KeyRevocation`, `KeyExpirationTime`, `SubkeyBinding`, `SubkeyRevocation`, explizite `KeyFlags` und eingebettete `Primary Key Binding`-Rücksignaturen; durchsucht alle Unterschlüssel; Altschlüssel ohne explizites `KeyFlags`-Subpaket werden fail-closed abgelehnt. | `test_key_selection_rejects_expired_revoked_wrong_flags_and_missing_flags`, `test_key_selection_skips_unsuitable_first_subkey_and_picks_later_valid_subkey` (**PASS**) |
-| **2. Notfall-Wipe vs. laufende Dateioperationen** | Asynchrone `readFileAsBytes()`-Aufrufe in `web/app.js` waren nicht an `sessionEpoch` gebunden und wurden beim Wipe nicht abgebrochen; verspätete `onload`-Ergebnisse konnten nach dem Worker-Neustart in der neuen Sitzung `rpc()` aufrufen. | Jede Operation (Import, Encrypt, Decrypt, Sign, Verify, Keygen) bindet `opEpoch = sessionEpoch` beim Start; aktive `FileReader` werden beim Wipe per `reader.abort()` abgebrochen; verspätete Puffer werden per `.fill(0)` genullt und vor jedem Worker-Aufruf, UI-Update oder Download (`lastDecEpoch`/`lastEncEpoch`/`lastSignEpoch`) verworfen. | `node scripts/test-wipe-regression.mjs` gegen `file:///…/dist/index.html` in Chrome: verzögerter Import + Wipe (`abortCalled=true`, `bufferWasZeroized=true`, `0 Schlüssel`) und verzögerte Entschlüsselung + Wipe (`decAbortCalled=true`, `decBufZeroized=true`, `decResultHidden=true`, `decOutputEmpty=true`, `downloadBlobCreated=false`) (**PASS**) |
-| **3. Budget für anonyme Entschlüsselungsversuche** | `audit.pkesk_count * store.secret_keys.len()` zählte nur Schlüssel-Bundles, während rPGP (`TheRing::find_session_key`) bei jedem anonymen PKESK sowohl den Primärschlüssel als auch alle Unterschlüssel über `match_identity` prüft. | `packet_check::estimate_pkesk_decrypt_budget` berechnet vorab die konservative Obergrenze `anonyme_PKESKs × Σ(1 + subkeys.len())` (entspricht rPGPs tatsächlichem Suchraum) und lehnt oberhalb von `MAX_ANON_DECRYPT_ATTEMPTS = 32` ab. | `test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit`: 30 (< 32, PASS), 32 (== 32, PASS), 33 (> 32, REJECT), 34 (> 32, REJECT), 3×11 = 33 (> 32, REJECT) (**PASS**) |
+| **1. OpenPGP encryption/signing key selection** | Previous selection only checked `algorithm().can_encrypt()/can_sign()` without validating revocations, expirations, bindings, or `KeyFlags`. | `crates/vault-wasm/src/key_select.rs` validates primary self-signatures, `KeyRevocation`, `KeyExpirationTime`, `SubkeyBinding`, `SubkeyRevocation`, explicit `KeyFlags`, and signing-subkey `Primary Key Binding` backsignatures; rejects legacy keys without `KeyFlags` fail-closed. | `test_key_selection_rejects_expired_revoked_wrong_flags_and_missing_flags`, `test_key_selection_skips_unsuitable_first_subkey_and_picks_later_valid_subkey` (**PASS**) |
+| **2. Emergency Wipe vs. in-flight file operations** | `FileReader` reads were not bound to `sessionEpoch` or aborted on wipe. | Operations bind to `opEpoch = sessionEpoch`; active `FileReader`s are aborted on wipe; late buffers are zeroized and discarded before RPC, UI update, or download. | `node scripts/test-wipe-regression.mjs` Tests 1 & 2 (**PASS**) |
+| **3. Anonymous PKESK decryption budget** | Counting only key bundles undercounted rPGP's actual search space across primary keys and subkeys. | `packet_check::estimate_pkesk_decrypt_budget` computes `anon_PKESKs × Σ(1 + subkeys.len())` before decryption and rejects above `MAX_ANON_DECRYPT_ATTEMPTS = 32`. | `test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit` (**PASS**) |
 
-## 3. Praktisch geprüfte Abnahmepunkte
+### New Findings Identified & Fixed in Fresh Review
 
-| # | Prüfung | Ergebnis | Nachweis / Details |
+| Finding & Severity | Impact & Location | Fix | Regression Test |
 |---|---|---|---|
-| 1 | Rust-Tests mit `Cargo.lock` (`cargo test --locked --offline`) | **PASS (11/11)** | Alle 8 Kern- und Paket-Audit-Tests + 3 neue Sicherheits-Regressionstests (Schlüsselauswahl & PKESK-Budget) bestanden. |
-| 2 | Wasm-Release-Build (`--locked`) & Single-File-HTML-Build | **PASS** | Zwei Läufe von `scripts/build.py` erzeugten byte-identisches `dist/index.html` (`8dcad2931b1583fdcf8500532291d0639ac3204c9b505c448985ced0abe5f0d7`); statische Prüfung auf strenge CSP, kein `unsafe-inline`, keine externen URLs, keine Browser-Storage-APIs bestanden. |
-| 3 | Deterministischer Browser-Wipe-Regressionstest (`file://`, Chrome) | **PASS** | `node scripts/test-wipe-regression.mjs` gegen `file:///…/dist/index.html`: Worker startet unter `file://`, verzögerter Datei-Import und verzögerte Datei-Entschlüsselung nach Wipe vollständig verworfen & genullt. |
-| 4 | End-to-End-Browser-Test über HTTP (`http://127.0.0.1:8765/`) | **PASS (5/5)** | Worker + Wasm bereit, genau 1 Netzwerkabruf (`GET /`), 0 Konsolen-/CSP-Fehler, v6-Keygen, RFC-9580-Verschlüsselung (`SEIPD v2 · 1 anonyme PKESK (v6)`, ohne `Version:`/`Comment:`), Entschlüsselung mit Integritätsprüfung, Notfall-Wipe. |
+| **4. Signature verification bypassed key eligibility checks (HIGH)** | `verify_inline_signatures` and `verify_detached` in `crates/vault-wasm/src/crypto.rs` verified signatures against raw primary keys and all subkeys without checking revocations, expirations, `SubkeyBinding`, explicit `Sign` Key Flags, signing-subkey `Primary Key Binding` backsignatures, or data signature expiration. A revoked/expired key or spoofed/unflagged subkey could display as `VALID`. | Added `select_verifying_keys` and exported `is_signature_active` in `crates/vault-wasm/src/key_select.rs`; passed `now_secs` in `DecryptRequest` and `VerifyDetachedRequest` (`web/app.js`, `crates/vault-wasm/src/crypto.rs`); tightened backsignature type & active-window checks in `select_signing_target`. | `test_signature_verification_rejects_revoked_expired_and_unbacksigged_keys` (**PASS**) |
+| **5. Resource-limit & packet-audit gaps (MEDIUM)** | `crates/vault-wasm/src/crypto.rs`, `limits.rs`, `packet_check.rs`: (a) Base64 inputs were decoded before checking size; (b) SKESK packets were not checked for excessive S2K Argon2 parameters in `inspect_raw_packets`; (c) multiple SEIPD packets overwrote `seipd_version`, allowing v1-SEIPD smuggling behind v2-SEIPD; (d) nested compressed packets were not explicitly rejected; (e) total matched PKESK attempts were not capped alongside anonymous attempts. | Added `check_base64_input_size` before `B64.decode`; added SKESK S2K parameter checks in `inspect_raw_packets`; added `seipd_count` to `PacketAudit` and enforced `seipd_count == 1`; rejected nested `Message::Compressed`; capped total PKESK attempts at `MAX_TOTAL_DECRYPT_ATTEMPTS = 64`. | `test_rejects_v1_seipd_tamper_truncation_and_multi_seipd_smuggling` + all 13 Rust tests (**PASS**) |
+| **6. `performWipe` re-entrancy & `btn-abort` state desync (MEDIUM)** | `web/app.js`: (a) `performWipe` temporarily overwrote `worker.onmessage` and restored `prevHandler` on `wiped`; a rapid double-wipe captured the temporary handler and permanently broke `worker.onmessage` while leaking stale fallback timers. (b) `btn-abort` respawned the Worker (clearing Rust's `SessionStore`) without clearing `sessionKeys` or UI fields. (c) Keygen download buttons did not zeroize temporary `Uint8Array` buffers. | Handled `wiped` inside the single `worker.onmessage` handler using `pendingWipeEpoch` and a single `wipeFallbackTimer`; routed `btn-abort` through `performWipe(..., true)`; zeroized temporary `Uint8Array` buffers on keygen download; guarded `ConfirmIdentity`/`RemoveKey` clicks with `opEpoch`. | `node scripts/test-wipe-regression.mjs` Tests 3, 4 & 5 (**PASS**) |
 
-## 4. Offene Abnahmepunkte und konkrete Blocker
+## 4. Executed Verification Runs
 
-Folgende Punkte konnten auf dieser Arbeitsumgebung **nicht** ausgeführt werden und bleiben vor einer Produktiv-Freigabe zwingend offen:
+| # | Check | Command / Target | Result | Details |
+|---|---|---|---|---|
+| 1 | Locked Rust unit, key-selection, integrity & packet-audit tests | `DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --locked --offline` | **PASS (13/13)** | All 11 prior tests + 2 new security regression tests (verifying-key eligibility; v1-SEIPD tamper/truncation + multi-SEIPD smuggling). |
+| 2 | Locked Wasm release build & local deterministic single-file HTML rebuild | `cargo build --target wasm32-unknown-unknown --release --locked --offline && python3 scripts/build.py` (×2) | **PASS** | Two consecutive local builds produced identical `dist/index.html` (`18745f7af62ee3d9f3cb136a47038517e564e2705e72b4acad36e2646237ba00`). Static checks confirmed strict CSP, no `unsafe-inline`, no `http://`/`https://` URLs, `lang="en"`, and 0 German UI strings. |
+| 3 | Chrome Wipe & session-isolation regression suite (`file://`) | `node scripts/test-wipe-regression.mjs` (Chrome `158.0.8127.88`) | **PASS (5/5)** | Verified delayed `FileReader` import + Wipe, delayed `FileReader` decrypt + Wipe, delayed Worker `rpc_result` import after Wipe + Worker restart, delayed Worker `rpc_result` decrypt (with real plaintext) after Wipe + Worker restart, and rapid double Emergency Wipe. |
+| 4 | Chrome E2E crypto, CSP, storage & English UI check (`file://`) | Chrome `158.0.8127.88` via CDP against `file:///…/dist/index.html` | **PASS** | `lang="en"`, 0 German matches, strict CSP, 0 CSP violations, 0 storage items (`localStorage=0`, `sessionStorage=0`, `cookie=""`), full RFC 9580 v6 keygen, encrypt+sign (`SEIPD v2 · 1 anonymous PKESK (v6)`, no `Version:`/`Comment:`), decrypt+verify, detached sign+verify, password fields cleared, Emergency Wipe verified. |
+| 5 | Firefox E2E crypto, CSP, storage & English UI check (`file://`) | Firefox `158.0.1` via WebDriver BiDi against `file:///…/dist/index.html` | **PASS** | Identical full pass: `lang="en"`, 0 German matches, strict CSP, 0 CSP violations, 0 storage items, full RFC 9580 v6 keygen, encrypt+sign, decrypt+verify, detached sign+verify, password fields cleared, Emergency Wipe verified. |
+| 6 | Live GitHub Pages deployment audit (synthetic data only) | `https://cclol.github.io/pgp/` (currently deployed build) | **PASS (with drift noted)** | HTTP 200, 1 total network request (`GET https://cclol.github.io/pgp/`), 0 third-party requests, strict CSP (`default-src 'none'`, `connect-src 'none'`, `worker-src blob:`), 0 console errors, synthetic keygen/encrypt/decrypt/wipe succeeded. **Note:** Live site still serves the earlier German build (`Wasm SHA-256: cd21bcbfec53b53d29a93ba023543784695d335da7116c0774e77b7a6da1a9bd`) pending explicit publish approval; browser storage APIs could not be queried in the webview harness on the live origin. |
 
-1. **GitHub Pages Live-Start (`https://cclol.github.io/pgp/`):**
-   - **Blocker:** Repository-Stand ist lokal; GitHub Pages und der Push/Workflow-Lauf auf `cclol/pgp` sind von dieser lokalen Umgebung aus nicht aktiviert/abgerufen worden.
-2. **Tor Browser (Online-URL und lokale `dist/index.html` offline):**
-   - **Blocker:** Tor Browser ist auf diesem macOS-Host nicht installiert (`/Applications` enthält Chrome, Firefox, Brave, Safari, aber keinen Tor Browser).
-3. **Bidirektionale Interoperabilität mit GnuPG und Kleopatra (beide Richtungen, je Profil):**
-   - **Blocker:** Weder `gpg` (GnuPG) noch `Kleopatra` sind auf diesem Host installiert (`gpg not found`).
-   - **Bekannte Profil-Einschränkung:** GnuPG 2.4.x / ältere Kleopatra-Versionen unterstützen RFC-9580-v6/v2-SEIPD nicht durchgängig; dafür ist das explizit wählbare Profil `Kompatibilität (v1-SEIPD + MDC + anonyme v3-PKESK)` ohne stillen Fallback vorhanden und muss gegen die konkreten Zielversionen geprüft werden.
-4. **Externe Release-Signaturprüfung der tatsächlichen `dist/index.html` und Ablehnung einer manipulierten Kopie:**
-   - **Blocker:** Kein externer Release-Signaturschlüssel vorhanden (bewusst außerhalb von Repo und CI) und kein externes Verifikationswerkzeug (`gpg` / `sq`) auf diesem Host installiert. Eine interne rPGP-Simulation (`test_release_html_detached_signature_and_tamper_rejection`) lief erfolgreich, ersetzt aber nicht den externen Prüflauf mit unabhängigem Tool und Prüfschlüssel.
-5. **SHA-256-Vergleich zweier sauberer Build-Umgebungen:**
-   - **Blocker:** Nur eine lokale Build-Umgebung (`aarch64-apple-darwin`) verfügbar; der zweite saubere Vergleichs-Build (z. B. GitHub Actions `ubuntu-24.04`) steht erst nach Push/CI-Ausführung zur Verfügung.
+## 5. Remaining Findings & Open Blockers
 
-## 5. Systembedingte Sicherheitsgrenzen
+### Remaining Non-Critical Findings
+1. **Low — Pages workflow deploys on every push to `main` (`.github/workflows/pages.yml#L3-L9`, `#L69`):** `CONCEPT.md` specifies binding deployments to a verified release state. Currently, `deploy` runs on pushes to `main` as well as `v*` tags, and CI does not yet run `scripts/test-wipe-regression.mjs`. Permissions are otherwise minimal (`contents: read` on `build`; `pages: write` + `id-token: write` on `deploy`) and all GitHub Actions are pinned to full commit SHAs.
+2. **Low — Live GitHub Pages deployment drift (`https://cclol.github.io/pgp/`):** The public site currently serves the pre-translation German build (`cd21bcbf…`) without the new security fixes from Section 3. Publishing is intentionally left for explicit user approval.
 
-- Unveränderliche JS-Strings im Browser-Heap, Browser-Caches, Swap/Auslagerungsspeicher, Absturzabbilder, Browser-Erweiterungen und die Betriebssystem-Zwischenablage liegen außerhalb der Kontrolle einer Web-App.
-- `worker.terminate()` beendet den Worker-Thread, garantiert aber auf OS-/Browser-Ebene kein sofortiges physisches Überschreiben aller Speicherseiten.
-- Online-Nutzung über GitHub Pages setzt Vertrauen in Server/Auslieferung und Endgerät voraus; für sensible Daten ist die extern signaturgeprüfte, offline geöffnete `dist/index.html` vorgesehen.
+### Open Acceptance Blockers (Not Verified in This Environment)
+1. **Tor Browser (online URL and offline `dist/index.html`):** Not tested — Tor Browser is not installed on this macOS host (`/Applications` contains Chrome, Firefox, Brave, and Safari only).
+2. **GnuPG and Kleopatra bidirectional interoperability:** Not tested — neither `gpg` nor `Kleopatra` is installed on this host. Known profile note: GnuPG 2.4.x / older Kleopatra releases may not support RFC 9580 v6 keys / v2-SEIPD; the explicit `Compatibility (v1-SEIPD + MDC + AES-256 + anonymous v3-PKESK)` profile exists for this purpose and still requires live bidirectional testing against exact target versions.
+3. **Independent reproducibility check across two clean environments:** Not verified — a **local rebuild** was verified deterministic on `aarch64-apple-darwin` (identical SHA-256 across repeated runs), but an **independent reproducibility check** comparing `dist/index.html` against a second clean environment (such as GitHub Actions `ubuntu-24.04`) has not been performed for this commit.
+4. **External detached release signature verification of the actual release artifact:** Not verified — no external release signing key (kept outside the repo and CI by design) and no external verification CLI (`gpg` / `sq`) are present on this host. The internal Rust test (`test_release_html_detached_signature_and_tamper_rejection`) validates rPGP's detached signing/tamper rejection logic only and does not replace external verification of the actual release `dist/index.html` with an independently obtained key.
+
+## 6. Inherent Security Boundaries
+
+- **Zero Trace** minimizes app-controlled traces and persistent session data; immutable JS strings in the browser heap, browser caches, swap space, crash dumps, browser extensions, and the operating-system clipboard remain outside a web app's control.
+- `worker.terminate()` terminates the Worker thread, but does not guarantee immediate physical overwriting of memory pages by the browser or OS.
+- Online usage via GitHub Pages requires trusting the served code, GitHub Pages, and the endpoint device; for sensitive data, verify the external release signature of `index.html` and open it offline.

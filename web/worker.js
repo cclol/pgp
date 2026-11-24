@@ -24,7 +24,7 @@ function fillRandom(ptr, len) {
 
 function callWasmJson(reqObj) {
   if (!wasmInstance) {
-    throw new Error("Kryptokern nicht initialisiert.");
+    throw new Error("Crypto core is not initialized.");
   }
   const ex = wasmInstance.exports;
   const reqBytes = encoder.encode(JSON.stringify(reqObj));

@@ -9,6 +9,9 @@
   let workerBlobUrl = null;
   let sessionEpoch = 1;
   let nextReqId = 1;
+  let pendingWipeEpoch = 0;
+  let pendingWipeReason = "";
+  let wipeFallbackTimer = null;
   const pending = new Map();
   const activeBlobUrls = new Set();
   const activeFileReaders = new Set();
@@ -24,7 +27,7 @@
   let lastSignIsArmor = true;
 
   function makeStaleError() {
-    const err = new Error("Vorgang durch Sitzungs-Wipe verworfen.");
+    const err = new Error("Operation discarded due to session wipe.");
     err.staleEpoch = true;
     return err;
   }
@@ -34,6 +37,13 @@
       try { reader.abort(); } catch (_) {}
     }
     activeFileReaders.clear();
+  }
+
+  function clearWipeTimer() {
+    if (wipeFallbackTimer !== null) {
+      clearTimeout(wipeFallbackTimer);
+      wipeFallbackTimer = null;
+    }
   }
 
   let timeoutSec = 300;
@@ -101,9 +111,9 @@
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      setStatus(label + " in Zwischenablage kopiert (wird von der App nicht automatisch überschrieben).", "ok");
+      setStatus(label + " copied to clipboard (the app does not automatically overwrite the clipboard).", "ok");
     } catch (_) {
-      setStatus("Zwischenablage nicht verfügbar — bitte manuell markieren und kopieren.", "err");
+      setStatus("Clipboard unavailable — please select and copy manually.", "err");
     }
   }
 
@@ -114,7 +124,7 @@
         return;
       }
       if (file.size > MAX_INPUT_BYTES) {
-        reject(new Error("Datei überschreitet das Limit von 16 MiB."));
+        reject(new Error("File exceeds the 16 MiB limit."));
         return;
       }
       const reader = new FileReader();
@@ -133,7 +143,7 @@
       };
       reader.onerror = () => {
         cleanup();
-        reject(opEpoch !== sessionEpoch ? makeStaleError() : new Error("Datei konnte nicht gelesen werden."));
+        reject(opEpoch !== sessionEpoch ? makeStaleError() : new Error("Failed to read file."));
       };
       reader.onabort = () => {
         cleanup();
@@ -156,6 +166,10 @@
   }
 
   function spawnWorker() {
+    clearWipeTimer();
+    pendingWipeEpoch = 0;
+    pendingWipeReason = "";
+
     if (worker) {
       try { worker.terminate(); } catch (_) {}
       worker = null;
@@ -165,8 +179,10 @@
       workerBlobUrl = null;
     }
     workerReady = false;
-    $("worker-badge").textContent = "Worker startet…";
-    $("worker-badge").className = "badge";
+    const badge = $("worker-badge");
+    badge.textContent = "Worker starting…";
+    badge.className = "badge";
+    badge.dataset.state = "starting";
 
     const epochAtSpawn = sessionEpoch;
     try {
@@ -174,7 +190,7 @@
       workerBlobUrl = URL.createObjectURL(blob);
       worker = new Worker(workerBlobUrl);
     } catch (err) {
-      showEnvError("Dedizierter Worker konnte nicht gestartet werden: " + String(err));
+      showEnvError("Failed to start dedicated Worker: " + String(err));
       return;
     }
 
@@ -185,7 +201,9 @@
       }
     };
 
-    worker.onmessage = (ev) => {
+    const currentWorker = worker;
+    currentWorker.onmessage = (ev) => {
+      if (currentWorker !== worker) return;
       revokeWorkerScript();
       const msg = ev.data;
       if (!msg) return;
@@ -195,31 +213,42 @@
       }
       if (msg.type === "ready") {
         workerReady = true;
-        $("worker-badge").textContent = "Worker + Wasm bereit";
-        $("worker-badge").className = "badge badge-ok";
+        badge.textContent = "Worker + Wasm ready";
+        badge.className = "badge badge-ok";
+        badge.dataset.state = "ready";
         setBusy(false);
-        setStatus("Kryptokern bereit (isoliert im Worker, kein Netzwerkverkehr).", "ok");
+        setStatus("Crypto core ready (isolated in Worker, no network activity).", "ok");
       } else if (msg.type === "wiped") {
-        setStatus("Sitzung vollständig bereinigt.", "ok");
+        if (msg.epoch === pendingWipeEpoch) {
+          clearWipeTimer();
+          const reason = pendingWipeReason;
+          pendingWipeEpoch = 0;
+          pendingWipeReason = "";
+          setBusy(false);
+          setStatus(reason || "Emergency wipe completed (buffers and UI cleared).", "ok");
+        } else {
+          setStatus("Session cleared.", "ok");
+        }
       } else if (msg.type === "rpc_result") {
         const entry = pending.get(msg.id);
-        if (entry) {
+        if (entry && entry.epoch === sessionEpoch) {
           pending.delete(msg.id);
           setBusy(pending.size > 0);
           entry.resolve(msg.result);
         }
       } else if (msg.type === "error") {
-        showEnvError("Worker-Fehler: " + msg.message);
+        showEnvError("Worker error: " + msg.message);
       }
     };
 
-    worker.onerror = (err) => {
+    currentWorker.onerror = (err) => {
+      if (currentWorker !== worker) return;
       revokeWorkerScript();
-      showEnvError("Worker-Laufzeitfehler: " + (err.message || "unbekannt"));
+      showEnvError("Worker runtime error: " + (err.message || "unknown"));
     };
 
     const wasmBytes = decodeBase64ToBytes(__VAULT_WASM_B64__);
-    worker.postMessage(
+    currentWorker.postMessage(
       { type: "init", wasmBuffer: wasmBytes.buffer, epoch: epochAtSpawn },
       [wasmBytes.buffer]
     );
@@ -232,7 +261,7 @@
       return Promise.reject(makeStaleError());
     }
     if (!worker || !workerReady) {
-      return Promise.reject(new Error("Kryptokern ist nicht bereit."));
+      return Promise.reject(new Error("Crypto core is not ready."));
     }
     const id = nextReqId++;
     setBusy(true);
@@ -277,6 +306,9 @@
       const el = $(id);
       if (el) el.hidden = true;
     }
+    $("dec-meta").textContent = "";
+    $("dec-sig-box").textContent = "";
+    $("ver-sig-box").textContent = "";
     zeroizeUint8(lastEncBytes);
     zeroizeUint8(lastDecBytes);
     zeroizeUint8(lastSignBytes);
@@ -292,9 +324,10 @@
   }
 
   function performWipe(reason, forceRestartWorker) {
-    // Bump epoch FIRST and abort all active FileReaders so no late file read or Worker
-    // result can ever trigger a Worker RPC, UI update, or plaintext download!
+    // Bump epoch FIRST, cancel any prior wipe timer, and abort all active FileReaders so no late
+    // file read or Worker result can ever trigger a Worker RPC, UI update, or plaintext download.
     sessionEpoch++;
+    clearWipeTimer();
     abortActiveFileReaders();
     for (const [, entry] of pending) {
       entry.reject(makeStaleError());
@@ -304,34 +337,28 @@
     clearAllUiFields();
     revokeAllBlobUrls();
     touchActivity();
-    setStatus(reason || "Notfall-Wipe ausgeführt…", "ok");
+    setStatus(reason || "Emergency wipe in progress…", "ok");
 
-    if (forceRestartWorker || !workerReady) {
+    if (forceRestartWorker || !workerReady || !worker) {
       spawnWorker();
-      setStatus(reason || "Notfall-Wipe ausgeführt (Worker neu gestartet).", "ok");
+      setStatus(reason || "Emergency wipe completed (Worker restarted).", "ok");
       return;
     }
 
     // Request cooperative zeroize in Worker; terminate & restart if it does not reply within 400ms
     const wipeEpoch = sessionEpoch;
-    let acked = false;
-    const prevHandler = worker.onmessage;
-    const fallbackTimer = setTimeout(() => {
-      if (!acked) {
+    pendingWipeEpoch = wipeEpoch;
+    pendingWipeReason = reason || "Emergency wipe completed (buffers and UI cleared).";
+    wipeFallbackTimer = setTimeout(() => {
+      if (pendingWipeEpoch === wipeEpoch && sessionEpoch === wipeEpoch) {
+        pendingWipeEpoch = 0;
+        pendingWipeReason = "";
+        wipeFallbackTimer = null;
         spawnWorker();
-        setStatus((reason || "Wipe") + " — Worker beendet und frisch gestartet.", "ok");
+        setStatus((reason || "Wipe") + " — Worker terminated and restarted fresh.", "ok");
       }
     }, 400);
 
-    worker.onmessage = (ev) => {
-      if (ev.data && ev.data.type === "wiped" && ev.data.epoch === wipeEpoch) {
-        acked = true;
-        clearTimeout(fallbackTimer);
-        worker.onmessage = prevHandler;
-        setBusy(false);
-        setStatus(reason || "Notfall-Wipe abgeschlossen (Puffer & Oberfläche geleert).", "ok");
-      }
-    };
     worker.postMessage({ type: "wipe", epoch: wipeEpoch });
   }
 
@@ -339,8 +366,10 @@
     const el = $("env-error");
     el.textContent = msg;
     el.hidden = false;
-    $("worker-badge").textContent = "Nicht verfügbar";
-    $("worker-badge").className = "badge badge-err";
+    const badge = $("worker-badge");
+    badge.textContent = "Unavailable";
+    badge.className = "badge badge-err";
+    badge.dataset.state = "error";
     setBusy(false);
   }
 
@@ -361,46 +390,48 @@
     };
 
     if (!sig || sig.status === "none") {
-      addLine("Signaturstatus", "Keine Signatur vorhanden");
+      addLine("Signature status", "No signature present");
       return;
     }
 
     if (sig.status === "valid") {
       container.classList.add("valid");
-      addLine("Signaturgültigkeit", "GÜLTIG (kryptografisch verifiziert)");
-      addLine("Signatur-Fingerprint", formatFp(sig.signer_fingerprint), "mono");
+      addLine("Signature validity", "VALID (cryptographically verified)");
+      addLine("Signer fingerprint", formatFp(sig.signer_fingerprint), "mono");
       addLine(
-        "Schlüssel-User-IDs (unbestätigt)",
-        sig.signer_user_ids && sig.signer_user_ids.length ? sig.signer_user_ids.join(", ") : "(keine User-ID)"
+        "Key User IDs (unconfirmed)",
+        sig.signer_user_ids && sig.signer_user_ids.length ? sig.signer_user_ids.join(", ") : "(no User ID)"
       );
       addLine(
-        "Nutzerbestätigte Identität",
+        "User-confirmed identity",
         sig.signer_identity_confirmed
-          ? "BESTÄTIGT (Fingerprint in dieser Sitzung manuell bestätigt)"
-          : "NICHT BESTÄTIGT — bitte Fingerprint unabhängig prüfen!",
+          ? "CONFIRMED (fingerprint manually confirmed in this session)"
+          : "NOT CONFIRMED — verify fingerprint out-of-band!",
         sig.signer_identity_confirmed ? "badge badge-ok" : "badge badge-warn"
       );
       if (sig.created_at) {
-        addLine("Signatur-Zeitstempel", new Date(sig.created_at * 1000).toISOString());
+        addLine("Signature timestamp", new Date(sig.created_at * 1000).toISOString());
       }
     } else if (sig.status === "unknown_signer") {
       container.classList.add("invalid");
-      addLine("Signaturgültigkeit", "UNBEKANNTER ABSENDER (kein passender öffentlicher Schlüssel geladen)");
+      addLine("Signature validity", "UNKNOWN SIGNER (no matching public key loaded)");
     } else {
       container.classList.add("invalid");
-      addLine("Signaturgültigkeit", "UNGÜLTIG (Signatur passt nicht zu Daten oder geladenen Schlüsseln)");
+      addLine("Signature validity", "INVALID (signature failed verification or key is ineligible/revoked/expired)");
     }
   }
 
   function renderKeys() {
-    $("key-count").textContent = sessionKeys.length + (sessionKeys.length === 1 ? " Schlüssel" : " Schlüssel");
+    const countEl = $("key-count");
+    countEl.dataset.count = String(sessionKeys.length);
+    countEl.textContent = sessionKeys.length + (sessionKeys.length === 1 ? " key" : " keys");
 
     const listEl = $("key-list");
     listEl.textContent = "";
     if (sessionKeys.length === 0) {
       const p = document.createElement("p");
       p.className = "muted small";
-      p.textContent = "Noch keine Schlüssel geladen.";
+      p.textContent = "No keys loaded yet.";
       listEl.appendChild(p);
     } else {
       for (const k of sessionKeys) {
@@ -410,7 +441,7 @@
         const head = document.createElement("div");
         head.className = "row";
         const uid = document.createElement("strong");
-        uid.textContent = k.user_ids.length ? k.user_ids[0] : "(ohne User-ID / pseudonym)";
+        uid.textContent = k.user_ids.length ? k.user_ids[0] : "(no User ID / pseudonymous)";
         head.appendChild(uid);
 
         const typeBadge = document.createElement("span");
@@ -428,33 +459,43 @@
         idStatus.className = "row";
         const confBadge = document.createElement("span");
         confBadge.className = "badge " + (k.identity_confirmed ? "badge-ok" : "badge-warn");
-        confBadge.textContent = k.identity_confirmed ? "Identität bestätigt" : "Identität unbestätigt";
+        confBadge.textContent = k.identity_confirmed ? "Identity confirmed" : "Identity unconfirmed";
         idStatus.appendChild(confBadge);
 
         const btnConf = document.createElement("button");
         btnConf.type = "button";
         btnConf.className = "btn btn-sm";
-        btnConf.textContent = k.identity_confirmed ? "Bestätigung aufheben" : "Fingerprint bestätigen";
+        btnConf.textContent = k.identity_confirmed ? "Revoke confirmation" : "Confirm fingerprint";
         btnConf.addEventListener("click", async () => {
+          const opEpoch = sessionEpoch;
           try {
             const res = await rpc("ConfirmIdentity", {
               fingerprint: k.fingerprint,
               confirmed: !k.identity_confirmed,
-            });
-            if (res.ok) await refreshKeys();
-          } catch (e) { setStatus(String(e), "err"); }
+            }, opEpoch);
+            if (opEpoch !== sessionEpoch) return;
+            if (res.ok) await refreshKeys(opEpoch);
+          } catch (e) {
+            if (opEpoch !== sessionEpoch || (e && e.staleEpoch)) return;
+            setStatus(String(e), "err");
+          }
         });
         idStatus.appendChild(btnConf);
 
         const btnDel = document.createElement("button");
         btnDel.type = "button";
         btnDel.className = "btn btn-sm btn-danger";
-        btnDel.textContent = "Entfernen";
+        btnDel.textContent = "Remove";
         btnDel.addEventListener("click", async () => {
+          const opEpoch = sessionEpoch;
           try {
-            await rpc("RemoveKey", { fingerprint: k.fingerprint });
-            await refreshKeys();
-          } catch (e) { setStatus(String(e), "err"); }
+            await rpc("RemoveKey", { fingerprint: k.fingerprint }, opEpoch);
+            if (opEpoch !== sessionEpoch) return;
+            await refreshKeys(opEpoch);
+          } catch (e) {
+            if (opEpoch !== sessionEpoch || (e && e.staleEpoch)) return;
+            setStatus(String(e), "err");
+          }
         });
         idStatus.appendChild(btnDel);
 
@@ -473,7 +514,7 @@
     if (encKeys.length === 0) {
       const s = document.createElement("span");
       s.className = "muted small";
-      s.textContent = "Kein verschlüsselungsfähiger Schlüssel geladen.";
+      s.textContent = "No encryption-capable key loaded.";
       recEl.appendChild(s);
     } else {
       for (const k of encKeys) {
@@ -484,8 +525,8 @@
         cb.value = k.fingerprint;
         if (checkedBefore.has(k.fingerprint) || encKeys.length === 1) cb.checked = true;
         const info = document.createElement("span");
-        const title = k.user_ids.length ? k.user_ids[0] : "(ohne User-ID)";
-        const conf = k.identity_confirmed ? " [bestätigt]" : " [unbestätigt]";
+        const title = k.user_ids.length ? k.user_ids[0] : "(no User ID)";
+        const conf = k.identity_confirmed ? " [confirmed]" : " [unconfirmed]";
         info.textContent = title + conf + " — " + formatFp(k.fingerprint);
         lbl.appendChild(cb);
         lbl.appendChild(info);
@@ -496,8 +537,8 @@
     // Update signer dropdowns
     const signKeys = sessionKeys.filter((k) => k.has_secret && k.can_sign);
     for (const [selId, emptyLabel] of [
-      ["enc-signer", "— Nicht signieren —"],
-      ["sign-key", "— Signaturschlüssel wählen —"],
+      ["enc-signer", "— Do not sign —"],
+      ["sign-key", "— Select signing key —"],
     ]) {
       const sel = $(selId);
       const prev = sel.value;
@@ -509,7 +550,7 @@
       for (const k of signKeys) {
         const opt = document.createElement("option");
         opt.value = k.fingerprint;
-        const label = k.user_ids.length ? k.user_ids[0] : "(ohne User-ID)";
+        const label = k.user_ids.length ? k.user_ids[0] : "(no User ID)";
         opt.textContent = label + " (" + k.fingerprint.slice(-16) + ")";
         sel.appendChild(opt);
       }
@@ -538,15 +579,15 @@
     const badge = $("mode-badge");
     const trust = $("trust-text");
     if (isFile) {
-      badge.textContent = "Offline-Datei (file://)";
+      badge.textContent = "Offline file (file://)";
       badge.className = "badge badge-ok";
       trust.textContent =
-        "Lokaler Offline-Start (file://): Die App führt alle OpenPGP-Operationen lokal ohne Netzwerkverbindungen aus. Stellen Sie sicher, dass diese HTML-Datei vor dem Öffnen extern signaturgeprüft wurde.";
+        "Local offline launch (file://): the app performs all OpenPGP operations locally without network connections. Verify the external detached signature of this HTML file before opening it.";
     } else {
       badge.textContent = "Online (" + location.origin + ")";
       badge.className = "badge badge-warn";
       trust.textContent =
-        "Online-Start über Webserver: Diese Nutzung setzt Vertrauen in den ausgelieferten Code, den Webserver (GitHub Pages) und das Endgerät voraus; beim Seitenabruf können Verbindungsdaten anfallen. Für hochsensible Daten laden Sie die signierte Release-HTML-Datei herunter, prüfen deren Signatur extern und öffnen sie offline.";
+        "Online launch from web server: this mode requires trusting the served code, the web server (GitHub Pages), and your device; connection metadata may be observed when fetching the page. For sensitive data, download the signed release HTML file, verify its signature externally, and open it offline.";
     }
   }
 
@@ -590,16 +631,16 @@
       $("timeout-badge").textContent = "Timeout: " + mm + ":" + ss;
 
       if (remaining === 0) {
-        performWipe("Inaktivitäts-Timeout erreicht — Sitzung bereinigt.", false);
+        performWipe("Inactivity timeout reached — session cleared.", false);
         return;
       }
 
       if (plaintextClearAt > 0) {
         const ptRem = Math.max(0, Math.ceil((plaintextClearAt - now) / 1000));
-        $("dec-autoclear").textContent = "Klartext leert in " + ptRem + "s";
+        $("dec-autoclear").textContent = "Plaintext clears in " + ptRem + "s";
         if (ptRem === 0) {
           clearPlaintextDisplay();
-          setStatus("Klartext-Anzeige nach Schutzfrist automatisch geleert.", "ok");
+          setStatus("Plaintext display automatically cleared after timeout.", "ok");
         }
       }
     }, 1000);
@@ -609,12 +650,12 @@
       const now = Date.now();
       if (document.visibilityState === "hidden") {
         if ($("wipe-on-hide").checked) {
-          performWipe("Tab ausgeblendet — Sitzung bereinigt.", true);
+          performWipe("Tab hidden — session cleared.", true);
         }
         return;
       }
       if (now - lastActivityAt >= timeoutSec * 1000) {
-        performWipe("Sperrfrist im Hintergrund abgelaufen — Sitzung bereinigt.", true);
+        performWipe("Inactivity lock expired in background — session cleared.", true);
       } else if (plaintextClearAt > 0 && now >= plaintextClearAt) {
         clearPlaintextDisplay();
       }
@@ -622,24 +663,16 @@
 
     document.addEventListener("visibilitychange", checkAfterResume);
     window.addEventListener("focus", checkAfterResume);
-    window.addEventListener("pagehide", () => performWipe("Seite verlassen.", true));
+    window.addEventListener("pagehide", () => performWipe("Page unloaded.", true));
   }
 
   function wireActions() {
     $("btn-wipe").addEventListener("click", () => {
-      performWipe("Notfall-Wipe durch Nutzer ausgelöst.", false);
+      performWipe("Emergency wipe triggered by user.", false);
     });
 
     $("btn-abort").addEventListener("click", () => {
-      sessionEpoch++;
-      abortActiveFileReaders();
-      for (const [, entry] of pending) {
-        entry.reject(makeStaleError());
-      }
-      pending.clear();
-      // Restart worker to stop any heavy computation immediately
-      spawnWorker();
-      setStatus("Laufender Vorgang abgebrochen; verspätete Ergebnisse werden verworfen.", "ok");
+      performWipe("Operation aborted — Worker restarted and session cleared.", true);
     });
 
     $("enc-signer").addEventListener("change", () => {
@@ -659,14 +692,14 @@
         } else {
           const text = $("import-text").value.trim();
           if (!text) {
-            setStatus("Bitte Schlüsseltext einfügen oder Datei wählen.", "err");
+            setStatus("Please paste key text or select a file.", "err");
             return;
           }
           bytes = new TextEncoder().encode(text);
           $("import-text").value = "";
         }
         if (opEpoch !== sessionEpoch) return;
-        setStatus("Importiere und prüfe Schlüssel…", "busy");
+        setStatus("Importing and validating keys…", "busy");
         const b64 = encodeBytesToBase64(bytes);
         zeroizeUint8(bytes);
         bytes = null;
@@ -674,18 +707,19 @@
         const res = await rpc("ImportKeys", { data_b64: b64 }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
-          setStatus("Import fehlgeschlagen: " + res.error, "err");
+          setStatus("Import failed: " + res.error, "err");
           return;
         }
         await refreshKeys(opEpoch);
         if (opEpoch !== sessionEpoch) return;
+        const n = res.data.imported.length;
         setStatus(
-          res.data.imported.length + " Schlüssel importiert (Identität noch unbestätigt — bitte Fingerprint prüfen).",
+          n + (n === 1 ? " key" : " keys") + " imported (identity unconfirmed — verify fingerprint out-of-band).",
           "ok"
         );
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
-        setStatus("Import-Fehler: " + String(err.message || err), "err");
+        setStatus("Import error: " + String(err.message || err), "err");
       } finally {
         zeroizeUint8(bytes);
       }
@@ -702,7 +736,7 @@
           $("enc-recipients").querySelectorAll("input[type=checkbox]:checked")
         ).map((c) => c.value);
         if (recipients.length === 0) {
-          setStatus("Bitte mindestens einen Empfänger auswählen.", "err");
+          setStatus("Please select at least one recipient.", "err");
           return;
         }
         const armor = $("enc-armor").checked;
@@ -715,7 +749,7 @@
         } else {
           const text = $("enc-text").value;
           if (!text) {
-            setStatus("Bitte Klartext eingeben oder Datei wählen.", "err");
+            setStatus("Please enter plaintext or select a file.", "err");
             return;
           }
           plainBytes = new TextEncoder().encode(text);
@@ -726,7 +760,7 @@
         plainBytes = null;
         if (opEpoch !== sessionEpoch) return;
 
-        setStatus("Verschlüssele im Worker…", "busy");
+        setStatus("Encrypting in Worker…", "busy");
         const res = await rpc("Encrypt", {
           plaintext_b64: b64,
           recipient_fingerprints: recipients,
@@ -738,7 +772,7 @@
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
-          setStatus("Verschlüsselung fehlgeschlagen: " + res.error, "err");
+          setStatus("Encryption failed: " + res.error, "err");
           return;
         }
         const outBytes = decodeBase64ToBytes(res.data.output_b64);
@@ -752,22 +786,22 @@
         lastEncIsArmor = armor;
         $("enc-output").value = armor
           ? res.data.output_armored
-          : "[Binäre OpenPGP-Ausgabe: " + lastEncBytes.length + " Bytes — bitte über Herunterladen speichern]";
+          : "[Binary OpenPGP output: " + lastEncBytes.length + " bytes — save using Download]";
         const a = res.data.packet_audit;
         $("enc-audit-badge").textContent =
-          "SEIPD v" + a.seipd_version + " · " + a.pkesk_count + " anonyme PKESK (v" + a.pkesk_versions.join(",v") + ")";
+          "SEIPD v" + a.seipd_version + " · " + a.pkesk_count + " anonymous PKESK (v" + a.pkesk_versions.join(",v") + ")";
         $("enc-result").hidden = false;
-        setStatus("Verschlüsselung abgeschlossen: " + res.data.profile_used, "ok");
+        setStatus("Encryption complete: " + res.data.profile_used, "ok");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
-        setStatus("Verschlüsselungsfehler: " + String(err.message || err), "err");
+        setStatus("Encryption error: " + String(err.message || err), "err");
       } finally {
         zeroizeUint8(plainBytes);
       }
     });
 
     $("btn-enc-copy").addEventListener("click", () => {
-      if (lastEncIsArmor && lastEncEpoch === sessionEpoch) copyExplicit($("enc-output").value, "Verschlüsselte Nachricht");
+      if (lastEncIsArmor && lastEncEpoch === sessionEpoch) copyExplicit($("enc-output").value, "Encrypted message");
     });
     $("btn-enc-download").addEventListener("click", () => {
       if (!lastEncBytes || lastEncEpoch !== sessionEpoch) return;
@@ -801,7 +835,7 @@
         } else {
           const text = $("dec-text").value.trim();
           if (!text) {
-            setStatus("Bitte verschlüsselte Nachricht einfügen oder Datei wählen.", "err");
+            setStatus("Please paste an encrypted message or select a file.", "err");
             return;
           }
           inBytes = new TextEncoder().encode(text);
@@ -812,16 +846,17 @@
         inBytes = null;
         if (opEpoch !== sessionEpoch) return;
 
-        setStatus("Entschlüssele und prüfe Nachrichtenintegrität…", "busy");
+        setStatus("Decrypting and verifying message integrity…", "busy");
         const res = await rpc("Decrypt", {
           input_b64: b64,
           passphrase: pw,
           allow_legacy_seipd_v1: allowV1,
+          now_secs: Math.floor(Date.now() / 1000),
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
           clearPlaintextDisplay();
-          setStatus("Entschlüsselung abgelehnt: " + res.error, "err");
+          setStatus("Decryption rejected: " + res.error, "err");
           return;
         }
         const ptBytes = decodeBase64ToBytes(res.data.plaintext_b64);
@@ -838,9 +873,9 @@
         meta.textContent = "";
         for (const label of [
           "SEIPD v" + res.data.seipd_version,
-          "Größe: " + lastDecBytes.length + " Bytes",
-          "Literal-Dateiname: " + (res.data.literal_filename || "(leer)"),
-          "Literal-Zeitstempel: " + res.data.literal_timestamp,
+          "Size: " + lastDecBytes.length + " bytes",
+          "Literal filename: " + (res.data.literal_filename || "(empty)"),
+          "Literal timestamp: " + res.data.literal_timestamp,
         ]) {
           const b = document.createElement("span");
           b.className = "badge";
@@ -850,20 +885,20 @@
 
         renderSignatureBox($("dec-sig-box"), res.data.signature);
         plaintextClearAt = Date.now() + PLAINTEXT_AUTOCLEAR_SEC * 1000;
-        $("dec-autoclear").textContent = "Klartext leert in " + PLAINTEXT_AUTOCLEAR_SEC + "s";
+        $("dec-autoclear").textContent = "Plaintext clears in " + PLAINTEXT_AUTOCLEAR_SEC + "s";
         $("dec-result").hidden = false;
-        setStatus("Entschlüsselung und Integritätsprüfung erfolgreich.", "ok");
+        setStatus("Decryption and integrity verification succeeded.", "ok");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
         clearPlaintextDisplay();
-        setStatus("Entschlüsselungsfehler: " + String(err.message || err), "err");
+        setStatus("Decryption error: " + String(err.message || err), "err");
       } finally {
         zeroizeUint8(inBytes);
       }
     });
 
     $("btn-dec-copy").addEventListener("click", () => {
-      if (lastDecEpoch === sessionEpoch) copyExplicit($("dec-output").value, "Klartext");
+      if (lastDecEpoch === sessionEpoch) copyExplicit($("dec-output").value, "Plaintext");
     });
     $("btn-dec-download").addEventListener("click", () => {
       if (!lastDecBytes || lastDecEpoch !== sessionEpoch) return;
@@ -871,7 +906,7 @@
     });
     $("btn-dec-clear").addEventListener("click", () => {
       clearPlaintextDisplay();
-      setStatus("Klartext-Anzeige geleert.", "ok");
+      setStatus("Plaintext display cleared.", "ok");
     });
 
     // SIGN DETACHED
@@ -883,7 +918,7 @@
       try {
         const signFp = $("sign-key").value;
         if (!signFp) {
-          setStatus("Bitte einen Signaturschlüssel auswählen.", "err");
+          setStatus("Please select a signing key.", "err");
           return;
         }
         const armor = $("sign-armor").checked;
@@ -894,7 +929,7 @@
         } else {
           const text = $("sign-text").value;
           if (!text) {
-            setStatus("Bitte Text eingeben oder Datei wählen.", "err");
+            setStatus("Please enter text or select a file.", "err");
             return;
           }
           dataBytes = new TextEncoder().encode(text);
@@ -905,7 +940,7 @@
         dataBytes = null;
         if (opEpoch !== sessionEpoch) return;
 
-        setStatus("Erzeuge abgetrennte Signatur…", "busy");
+        setStatus("Creating detached signature…", "busy");
         const res = await rpc("SignDetached", {
           data_b64: b64,
           sign_fingerprint: signFp,
@@ -915,7 +950,7 @@
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
-          setStatus("Signierung fehlgeschlagen: " + res.error, "err");
+          setStatus("Signing failed: " + res.error, "err");
           return;
         }
         const sigOut = decodeBase64ToBytes(res.data.signature_b64);
@@ -929,19 +964,19 @@
         lastSignIsArmor = armor;
         $("sign-output").value = armor
           ? res.data.signature_armored
-          : "[Binäre Signatur: " + lastSignBytes.length + " Bytes]";
+          : "[Binary signature: " + lastSignBytes.length + " bytes]";
         $("sign-result").hidden = false;
-        setStatus("Abgetrennte Signatur erzeugt.", "ok");
+        setStatus("Detached signature created.", "ok");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
-        setStatus("Signaturfehler: " + String(err.message || err), "err");
+        setStatus("Signing error: " + String(err.message || err), "err");
       } finally {
         zeroizeUint8(dataBytes);
       }
     });
 
     $("btn-sign-copy").addEventListener("click", () => {
-      if (lastSignIsArmor && lastSignEpoch === sessionEpoch) copyExplicit($("sign-output").value, "Signatur");
+      if (lastSignIsArmor && lastSignEpoch === sessionEpoch) copyExplicit($("sign-output").value, "Signature");
     });
     $("btn-sign-download").addEventListener("click", () => {
       if (!lastSignBytes || lastSignEpoch !== sessionEpoch) return;
@@ -965,7 +1000,7 @@
         } else {
           const text = $("ver-text").value;
           if (!text) {
-            setStatus("Bitte zu prüfende Daten angeben.", "err");
+            setStatus("Please provide data to verify.", "err");
             return;
           }
           dataBytes = new TextEncoder().encode(text);
@@ -978,7 +1013,7 @@
         } else {
           const text = $("ver-sig-text").value.trim();
           if (!text) {
-            setStatus("Bitte Signatur angeben.", "err");
+            setStatus("Please provide a signature.", "err");
             return;
           }
           sigBytes = new TextEncoder().encode(text);
@@ -993,22 +1028,23 @@
         sigBytes = null;
         if (opEpoch !== sessionEpoch) return;
 
-        setStatus("Prüfe Signatur…", "busy");
+        setStatus("Verifying signature…", "busy");
         const res = await rpc("VerifyDetached", {
           data_b64: dataB64,
           signature_b64: sigB64,
+          now_secs: Math.floor(Date.now() / 1000),
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
-          setStatus("Verifikation fehlgeschlagen: " + res.error, "err");
+          setStatus("Verification failed: " + res.error, "err");
           return;
         }
         renderSignatureBox($("ver-sig-box"), res.data);
         $("ver-result").hidden = false;
-        setStatus("Signaturprüfung abgeschlossen.", res.data.status === "valid" ? "ok" : "err");
+        setStatus("Signature verification completed.", res.data.status === "valid" ? "ok" : "err");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
-        setStatus("Verifikationsfehler: " + String(err.message || err), "err");
+        setStatus("Verification error: " + String(err.message || err), "err");
       } finally {
         zeroizeUint8(dataBytes);
         zeroizeUint8(sigBytes);
@@ -1025,14 +1061,14 @@
       $("kg-pw2").value = "";
       try {
         if (pw !== pw2) {
-          setStatus("Passphrasen stimmen nicht überein.", "err");
+          setStatus("Passphrases do not match.", "err");
           return;
         }
         if (pw.length < 8) {
-          setStatus("Passphrase muss mindestens 8 Zeichen lang sein (12+ empfohlen).", "err");
+          setStatus("Passphrase must be at least 8 characters long (12+ recommended).", "err");
           return;
         }
-        setStatus("Erzeuge RFC-9580-v6-Schlüssel (Argon2 + Ed25519 + X25519)…", "busy");
+        setStatus("Generating RFC 9580 v6 key (Argon2 + Ed25519 + X25519)…", "busy");
         const res = await rpc("GenerateKey", {
           user_id: uid.trim() ? uid.trim() : null,
           passphrase: pw,
@@ -1040,7 +1076,7 @@
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
         if (!res.ok) {
-          setStatus("Schlüsselerzeugung fehlgeschlagen: " + res.error, "err");
+          setStatus("Key generation failed: " + res.error, "err");
           return;
         }
         $("kg-fp").textContent = formatFp(res.data.summary.fingerprint);
@@ -1049,28 +1085,40 @@
         $("kg-result").hidden = false;
         await refreshKeys(opEpoch);
         if (opEpoch !== sessionEpoch) return;
-        setStatus("Schlüssel erzeugt (" + res.data.profile + ") und in Sitzung geladen.", "ok");
+        setStatus("Key generated (" + res.data.profile + ") and loaded into session.", "ok");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
-        setStatus("Schlüsselerzeugungsfehler: " + String(err.message || err), "err");
+        setStatus("Key generation error: " + String(err.message || err), "err");
       }
     });
 
-    $("btn-kg-pub-copy").addEventListener("click", () => copyExplicit($("kg-pub").value, "Öffentlicher Schlüssel"));
-    $("btn-kg-sec-copy").addEventListener("click", () => copyExplicit($("kg-sec").value, "Geheimer Schlüssel"));
+    $("btn-kg-pub-copy").addEventListener("click", () => copyExplicit($("kg-pub").value, "Public key"));
+    $("btn-kg-sec-copy").addEventListener("click", () => copyExplicit($("kg-sec").value, "Secret key"));
     $("btn-kg-pub-dl").addEventListener("click", () => {
       const text = $("kg-pub").value;
-      if (text) downloadBytes(new TextEncoder().encode(text), "vault-public-key.asc", "text/plain;charset=utf-8");
+      if (!text) return;
+      const bytes = new TextEncoder().encode(text);
+      try {
+        downloadBytes(bytes, "vault-public-key.asc", "text/plain;charset=utf-8");
+      } finally {
+        zeroizeUint8(bytes);
+      }
     });
     $("btn-kg-sec-dl").addEventListener("click", () => {
       const text = $("kg-sec").value;
-      if (text) downloadBytes(new TextEncoder().encode(text), "vault-secret-key.asc", "text/plain;charset=utf-8");
+      if (!text) return;
+      const bytes = new TextEncoder().encode(text);
+      try {
+        downloadBytes(bytes, "vault-secret-key.asc", "text/plain;charset=utf-8");
+      } finally {
+        zeroizeUint8(bytes);
+      }
     });
   }
 
   // Startup checks (CSP, WebAssembly, Worker, CSPRNG)
   window.addEventListener("securitypolicyviolation", (e) => {
-    setStatus("CSP-Verletzung blockiert: " + e.violatedDirective, "err");
+    setStatus("CSP violation blocked: " + e.violatedDirective, "err");
   });
 
   initTrustBanner();
@@ -1080,7 +1128,7 @@
 
   if (typeof WebAssembly !== "object" || typeof Worker !== "function" || !(self.crypto && self.crypto.getRandomValues)) {
     showEnvError(
-      "Erforderliche Browser-Funktionen (WebAssembly, Web Worker oder crypto.getRandomValues) sind deaktiviert — z. B. im Tor Browser auf Sicherheitsstufe „Safest“ oder „Safer“. Ohne CSPRNG und WebAssembly startet der Kryptokern nicht."
+      "Required browser features (WebAssembly, Web Worker, or crypto.getRandomValues) are disabled — for example in Tor Browser at the 'Safest' or 'Safer' security level. The crypto core will not start without CSPRNG and WebAssembly."
     );
     return;
   }

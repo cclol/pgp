@@ -17,6 +17,11 @@ pub enum SignTarget<'a> {
     Subkey(&'a PacketSecretSubkey),
 }
 
+pub enum VerifyTarget<'a> {
+    Primary(&'a PacketPublicKey),
+    Subkey(&'a PacketPublicSubkey),
+}
+
 /// Extracts explicit `KeyFlags` from a signature's hashed subpackets.
 /// Returns `None` if no `KeyFlags` subpacket is present (e.g. legacy keys without Key Flags).
 fn explicit_key_flags(sig: &Signature) -> Option<KeyFlags> {
@@ -33,7 +38,7 @@ fn sig_created_secs(sig: &Signature) -> u32 {
     sig.created().map(|t| t.as_secs()).unwrap_or(0)
 }
 
-fn is_signature_active(sig: &Signature, now_secs: u32) -> bool {
+pub fn is_signature_active(sig: &Signature, now_secs: u32) -> bool {
     let Some(created) = sig.created() else {
         return false;
     };
@@ -77,7 +82,7 @@ where
     let created_secs = primary.created_at().as_secs();
     if created_secs > now_secs {
         return Err(format!(
-            "Schlüssel {fp} hat einen Erstellungszeitpunkt in der Zukunft."
+            "Key {fp} has a creation timestamp in the future."
         ));
     }
 
@@ -88,7 +93,7 @@ where
         .chain(details.direct_signatures.iter())
     {
         if sig.typ() == Some(SignatureType::KeyRevocation) && sig.verify_key(primary).is_ok() {
-            return Err(format!("Schlüssel {fp} wurde widerrufen."));
+            return Err(format!("Key {fp} has been revoked."));
         }
     }
 
@@ -176,7 +181,7 @@ where
         (None, Some(u)) => u,
         (None, None) => {
             return Err(format!(
-                "Schlüssel {fp} besitzt keine gültige, aktive Selbstsignatur."
+                "Key {fp} has no valid, active self-signature."
             ));
         }
     };
@@ -187,7 +192,7 @@ where
             .map(|d| is_key_expired(created_secs, d, now_secs))
             .unwrap_or(false)
     {
-        return Err(format!("Schlüssel {fp} ist abgelaufen."));
+        return Err(format!("Key {fp} has expired."));
     }
 
     let flags = explicit_key_flags(authoritative)
@@ -209,7 +214,7 @@ where
     S: KeyDetails + Serialize,
 {
     if subkey.created_at().as_secs() > now_secs {
-        return Err("Erstellungszeitpunkt in der Zukunft");
+        return Err("creation timestamp in the future");
     }
 
     // Any valid SubkeyRevocation revokes this subkey
@@ -217,7 +222,7 @@ where
         if sig.typ() == Some(SignatureType::SubkeyRevocation)
             && sig.verify_subkey_binding(primary, subkey).is_ok()
         {
-            return Err("widerrufen");
+            return Err("revoked");
         }
     }
 
@@ -239,9 +244,9 @@ where
         }
     }
 
-    let binding = best.ok_or("keine gültige Bindungssignatur")?;
+    let binding = best.ok_or("no valid binding signature")?;
     if is_key_expired(subkey.created_at().as_secs(), binding, now_secs) {
-        return Err("abgelaufen");
+        return Err("expired");
     }
 
     Ok(binding)
@@ -264,7 +269,7 @@ pub fn select_encryption_target<'a>(
 
     for sub in &pk.public_subkeys {
         if !sub.key.algorithm().can_encrypt() {
-            reasons.push("Algorithmus nicht verschlüsselungsfähig");
+            reasons.push("algorithm cannot encrypt");
             continue;
         }
         let binding = match validate_subkey_binding(
@@ -280,11 +285,11 @@ pub fn select_encryption_target<'a>(
             }
         };
         let Some(flags) = explicit_key_flags(binding) else {
-            reasons.push("Altschlüssel ohne explizite Key Flags");
+            reasons.push("legacy key without explicit Key Flags");
             continue;
         };
         if !(flags.encrypt_comms() || flags.encrypt_storage()) {
-            reasons.push("zweckfremde Key Flags (keine Verschlüsselungs-Freigabe)");
+            reasons.push("wrong-purpose Key Flags (not enabled for encryption)");
             continue;
         }
         let created = sub.key.created_at().as_secs();
@@ -303,20 +308,20 @@ pub fn select_encryption_target<'a>(
             Some(flags) if flags.encrypt_comms() || flags.encrypt_storage() => {
                 return Ok(EncTarget::Primary(&pk.primary_key));
             }
-            Some(_) => reasons.push("Primärschlüssel ohne Verschlüsselungs-Key-Flags"),
-            None => reasons.push("Primärschlüssel ohne explizite Key Flags"),
+            Some(_) => reasons.push("primary key lacks encryption Key Flags"),
+            None => reasons.push("primary key lacks explicit Key Flags"),
         }
     }
 
     reasons.sort_unstable();
     reasons.dedup();
     let detail = if reasons.is_empty() {
-        "kein verschlüsselungsfähiger Schlüssel vorhanden".to_string()
+        "no encryption-capable key available".to_string()
     } else {
         reasons.join(", ")
     };
     Err(format!(
-        "Kein zulässiger Verschlüsselungsschlüssel für {fp} gefunden ({detail})."
+        "No eligible encryption key found for {fp} ({detail})."
     ))
 }
 
@@ -353,20 +358,23 @@ pub fn select_signing_target<'a>(
             }
         };
         let Some(flags) = explicit_key_flags(binding) else {
-            reasons.push("Altschlüssel ohne explizite Key Flags");
+            reasons.push("legacy key without explicit Key Flags");
             continue;
         };
         if !flags.sign() {
-            reasons.push("zweckfremde Key Flags (keine Signatur-Freigabe)");
+            reasons.push("wrong-purpose Key Flags (not enabled for signing)");
             continue;
         }
         // RFC 9580 / RFC 4880: signing-capable subkeys MUST carry a valid embedded backsignature
         let Some(backsig) = binding.embedded_signature() else {
-            reasons.push("fehlende Rücksignatur (Primary Key Binding) am Signatur-Subkey");
+            reasons.push("missing primary-key binding backsignature on signing subkey");
             continue;
         };
-        if backsig.verify_primary_key_binding(&sub_pub, &primary_pub).is_err() {
-            reasons.push("ungültige Rücksignatur am Signatur-Subkey");
+        if backsig.typ() != Some(SignatureType::KeyBinding)
+            || !is_signature_active(backsig, now_secs)
+            || backsig.verify_primary_key_binding(&sub_pub, &primary_pub).is_err()
+        {
+            reasons.push("invalid or inactive primary-key binding backsignature on signing subkey");
             continue;
         }
         let created = sub.key.created_at().as_secs();
@@ -382,19 +390,72 @@ pub fn select_signing_target<'a>(
     if sk.primary_key.algorithm().can_sign() {
         match primary_val.flags {
             Some(flags) if flags.sign() => return Ok(SignTarget::Primary(&sk.primary_key)),
-            Some(_) => reasons.push("Primärschlüssel ohne Signatur-Key-Flag"),
-            None => reasons.push("Primärschlüssel ohne explizite Key Flags"),
+            Some(_) => reasons.push("primary key lacks Sign Key Flag"),
+            None => reasons.push("primary key lacks explicit Key Flags"),
         }
     }
 
     reasons.sort_unstable();
     reasons.dedup();
     let detail = if reasons.is_empty() {
-        "kein signierfähiger Schlüssel vorhanden".to_string()
+        "no signing-capable key available".to_string()
     } else {
         reasons.join(", ")
     };
     Err(format!(
-        "Kein zulässiger Signaturschlüssel für {fp} gefunden ({detail})."
+        "No eligible signing key found for {fp} ({detail})."
     ))
+}
+
+/// Returns all currently valid, non-revoked, non-expired verifying keys (primary and/or signing subkeys)
+/// with explicit `Sign` Key Flags (and valid embedded primary-key binding backsignatures for subkeys).
+pub fn select_verifying_keys<'a>(
+    pk: &'a SignedPublicKey,
+    now_secs: u32,
+) -> Vec<VerifyTarget<'a>> {
+    let Ok(primary_val) = validate_primary(&pk.primary_key, &pk.details, now_secs) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<VerifyTarget<'a>> = Vec::new();
+
+    if pk.primary_key.algorithm().can_sign() {
+        if let Some(flags) = primary_val.flags {
+            if flags.sign() {
+                out.push(VerifyTarget::Primary(&pk.primary_key));
+            }
+        }
+    }
+
+    for sub in &pk.public_subkeys {
+        if !sub.key.algorithm().can_sign() {
+            continue;
+        }
+        let Ok(binding) = validate_subkey_binding(
+            &pk.primary_key,
+            &sub.key,
+            &sub.signatures,
+            now_secs,
+        ) else {
+            continue;
+        };
+        let Some(flags) = explicit_key_flags(binding) else {
+            continue;
+        };
+        if !flags.sign() {
+            continue;
+        }
+        let Some(backsig) = binding.embedded_signature() else {
+            continue;
+        };
+        if backsig.typ() != Some(SignatureType::KeyBinding)
+            || !is_signature_active(backsig, now_secs)
+            || backsig.verify_primary_key_binding(&sub.key, &pk.primary_key).is_err()
+        {
+            continue;
+        }
+        out.push(VerifyTarget::Subkey(&sub.key));
+    }
+
+    out
 }

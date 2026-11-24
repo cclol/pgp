@@ -111,6 +111,7 @@ fn test_rfc9580_multi_recipient_encrypt_audit_and_decrypt() {
             input_b64: enc.output_b64.clone(),
             passphrase: Some("bob-passphrase-5678".into()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     )
     .expect("bob should decrypt");
@@ -137,6 +138,7 @@ fn test_rfc9580_multi_recipient_encrypt_audit_and_decrypt() {
             input_b64: enc.output_b64,
             passphrase: Some("bob-passphrase-5678".into()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     )
     .expect("bob decrypt 2");
@@ -173,6 +175,7 @@ fn test_compat_seipd_v1_explicit_read_profile() {
             input_b64: enc.output_b64.clone(),
             passphrase: Some("alice-passphrase-1234".into()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     );
     assert!(err.is_err());
@@ -184,6 +187,7 @@ fn test_compat_seipd_v1_explicit_read_profile() {
             input_b64: enc.output_b64,
             passphrase: Some("alice-passphrase-1234".into()),
             allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
         },
     )
     .expect("v1 decrypt with explicit opt-in");
@@ -222,6 +226,7 @@ fn test_rejects_tampered_and_truncated_ciphertext() {
             input_b64: B64.encode(&tampered),
             passphrase: Some("alice-passphrase-1234".into()),
             allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
         },
     );
     assert!(res_tamper.is_err(), "tampered ciphertext must be rejected");
@@ -234,6 +239,7 @@ fn test_rejects_tampered_and_truncated_ciphertext() {
             input_b64: B64.encode(truncated),
             passphrase: Some("alice-passphrase-1234".into()),
             allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
         },
     );
     assert!(res_trunc.is_err(), "truncated ciphertext must be rejected");
@@ -252,12 +258,13 @@ fn test_rejects_unauthenticated_sed_packet() {
             input_b64: B64.encode(&sed_pkt),
             passphrase: Some("anything".into()),
             allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
         },
     );
     assert!(res.is_err());
     let msg = res.err().unwrap();
     assert!(
-        msg.contains("SED") || msg.contains("Unauthentifiziert"),
+        msg.contains("SED") || msg.contains("unauthenticated"),
         "unexpected error: {msg}"
     );
 }
@@ -288,6 +295,7 @@ fn test_detached_sign_and_verify() {
         VerifyDetachedRequest {
             data_b64: B64.encode(data),
             signature_b64: signed.signature_b64.clone(),
+            now_secs: TEST_NOW,
         },
     )
     .expect("verify");
@@ -303,6 +311,7 @@ fn test_detached_sign_and_verify() {
         VerifyDetachedRequest {
             data_b64: B64.encode(b"Release artifact payload v1.0.1"),
             signature_b64: signed.signature_b64,
+            now_secs: TEST_NOW,
         },
     )
     .expect("verify returns invalid status");
@@ -385,6 +394,7 @@ fn test_release_html_detached_signature_and_tamper_rejection() {
         VerifyDetachedRequest {
             data_b64: B64.encode(html_artifact),
             signature_b64: sig.signature_b64.clone(),
+            now_secs: TEST_NOW,
         },
     )
     .expect("verify original HTML");
@@ -398,6 +408,7 @@ fn test_release_html_detached_signature_and_tamper_rejection() {
         VerifyDetachedRequest {
             data_b64: B64.encode(&tampered_html),
             signature_b64: sig.signature_b64,
+            now_secs: TEST_NOW,
         },
     )
     .expect("verify tampered HTML");
@@ -619,7 +630,7 @@ fn test_key_selection_rejects_expired_revoked_wrong_flags_and_missing_flags() {
     let err = select_encryption_target(&expired_sub.to_public_key(), now)
         .err()
         .expect("expired subkey must be rejected");
-    assert!(err.contains("abgelaufen"), "unexpected error: {err}");
+    assert!(err.contains("expired"), "unexpected error: {err}");
 
     // 2. Revoked encryption subkey -> rejected
     let revoked_sub = build_custom_v6_key(
@@ -638,7 +649,7 @@ fn test_key_selection_rejects_expired_revoked_wrong_flags_and_missing_flags() {
     let err = select_encryption_target(&revoked_sub.to_public_key(), now)
         .err()
         .expect("revoked subkey must be rejected");
-    assert!(err.contains("widerrufen"), "unexpected error: {err}");
+    assert!(err.contains("revoked"), "unexpected error: {err}");
 
     // 3. Wrong-purpose subkey (auth-only flag on X25519) -> rejected
     let wrong_flags = build_custom_v6_key(
@@ -657,7 +668,7 @@ fn test_key_selection_rejects_expired_revoked_wrong_flags_and_missing_flags() {
     let err = select_encryption_target(&wrong_flags.to_public_key(), now)
         .err()
         .expect("wrong-purpose subkey must be rejected");
-    assert!(err.contains("zweckfremde"), "unexpected error: {err}");
+    assert!(err.contains("wrong-purpose"), "unexpected error: {err}");
 
     // 4. Legacy subkey without explicit KeyFlags subpacket -> fail-closed rejection
     let no_flags = build_custom_v6_key(
@@ -837,6 +848,7 @@ fn test_key_selection_skips_unsuitable_first_subkey_and_picks_later_valid_subkey
             input_b64: enc.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: now,
         },
     )
     .expect("decrypt with later valid subkeys");
@@ -860,6 +872,7 @@ fn test_key_selection_skips_unsuitable_first_subkey_and_picks_later_valid_subkey
         VerifyDetachedRequest {
             data_b64: B64.encode(b"Detached subkey payload"),
             signature_b64: detached.signature_b64,
+            now_secs: now,
         },
     )
     .expect("verify detached subkey sig");
@@ -919,6 +932,7 @@ fn test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit() {
             input_b64: msg_below.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     );
     assert!(dec_below.is_ok(), "30 attempts (< 32) must be allowed");
@@ -933,6 +947,7 @@ fn test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit() {
             input_b64: msg_at.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     );
     assert!(dec_at.is_ok(), "32 attempts (== 32) must be allowed");
@@ -947,6 +962,7 @@ fn test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit() {
             input_b64: msg_above_sub.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     )
     .err()
@@ -963,6 +979,7 @@ fn test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit() {
             input_b64: msg_33.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     )
     .err()
@@ -979,9 +996,226 @@ fn test_anon_pkesk_budget_multi_subkey_below_at_and_above_limit() {
             input_b64: msg_3p.output_b64,
             passphrase: Some(String::new()),
             allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
         },
     )
     .err()
     .expect("3 anon PKESKs × 11 keys = 33 (> 32) must be rejected");
     assert!(err_3p.contains("33 > 32"), "unexpected error: {err_3p}");
+}
+
+#[test]
+fn test_signature_verification_rejects_revoked_expired_and_unbacksigged_keys() {
+    use pgp::composed::{DetachedSignature, KeyType};
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::packet::KeyFlags;
+    use pgp::types::Password;
+    use std::io::Cursor;
+
+    let mut certify_only = KeyFlags::default();
+    certify_only.set_certify(true);
+
+    let mut certify_sign = KeyFlags::default();
+    certify_sign.set_certify(true);
+    certify_sign.set_sign(true);
+
+    let mut sign_flags = KeyFlags::default();
+    sign_flags.set_sign(true);
+
+    let payload = b"Verification key-eligibility regression payload";
+    let pw = Password::empty();
+    let mut rng = crate::crypto::VaultRng;
+
+    // 1. Revoked primary key: sign directly with primary_key, verify must NOT return "valid"
+    let revoked_primary = build_custom_v6_key(TEST_NOW, Some(certify_sign.clone()), None, true, &[]);
+    let sig_revoked = DetachedSignature::sign_binary_data(
+        &mut rng,
+        &revoked_primary.primary_key,
+        &pw,
+        HashAlgorithm::Sha256,
+        Cursor::new(payload),
+    )
+    .expect("raw sign");
+    let sig_revoked_b64 = B64.encode(sig_revoked.to_armored_string(Default::default()).unwrap().as_bytes());
+    let mut store_rev = SessionStore::default();
+    store_rev.upsert_public(revoked_primary.to_public_key(), true);
+    let ver_rev = verify_detached(
+        &store_rev,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(payload),
+            signature_b64: sig_revoked_b64,
+            now_secs: TEST_NOW + 100,
+        },
+    )
+    .expect("verify returns result");
+    assert_eq!(ver_rev.status, "invalid", "revoked primary key signature must be rejected");
+
+    // 2. Expired primary key -> rejected
+    let expired_primary = build_custom_v6_key(TEST_NOW, Some(certify_sign), Some(50), false, &[]);
+    let sig_exp = DetachedSignature::sign_binary_data(
+        &mut rng,
+        &expired_primary.primary_key,
+        &pw,
+        HashAlgorithm::Sha256,
+        Cursor::new(payload),
+    )
+    .expect("raw sign");
+    let sig_exp_b64 = B64.encode(sig_exp.to_armored_string(Default::default()).unwrap().as_bytes());
+    let mut store_exp = SessionStore::default();
+    store_exp.upsert_public(expired_primary.to_public_key(), true);
+    let ver_exp = verify_detached(
+        &store_exp,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(payload),
+            signature_b64: sig_exp_b64,
+            now_secs: TEST_NOW + 100,
+        },
+    )
+    .expect("verify returns result");
+    assert_eq!(ver_exp.status, "invalid", "expired primary key signature must be rejected");
+
+    // 3. Signing subkey WITHOUT embedded Primary Key Binding backsignature -> rejected
+    let no_backsig = build_custom_v6_key(
+        TEST_NOW,
+        Some(certify_only.clone()),
+        None,
+        false,
+        &[SubkeySpec {
+            key_type: KeyType::Ed25519,
+            flags: Some(sign_flags.clone()),
+            expiration_secs: None,
+            revoked: false,
+            with_backsig: false,
+        }],
+    );
+    let sig_nobacksig = DetachedSignature::sign_binary_data(
+        &mut rng,
+        &no_backsig.secret_subkeys[0].key,
+        &pw,
+        HashAlgorithm::Sha256,
+        Cursor::new(payload),
+    )
+    .expect("raw subkey sign");
+    let sig_nobacksig_b64 =
+        B64.encode(sig_nobacksig.to_armored_string(Default::default()).unwrap().as_bytes());
+    let mut store_nb = SessionStore::default();
+    store_nb.upsert_public(no_backsig.to_public_key(), true);
+    let ver_nb = verify_detached(
+        &store_nb,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(payload),
+            signature_b64: sig_nobacksig_b64,
+            now_secs: TEST_NOW + 100,
+        },
+    )
+    .expect("verify returns result");
+    assert_eq!(
+        ver_nb.status, "invalid",
+        "signing subkey without backsignature must be rejected during verification"
+    );
+
+    // 4. Primary key with Certify-only flag (no Sign flag) -> rejected
+    let cert_only_key = build_custom_v6_key(TEST_NOW, Some(certify_only), None, false, &[]);
+    let sig_cert = DetachedSignature::sign_binary_data(
+        &mut rng,
+        &cert_only_key.primary_key,
+        &pw,
+        HashAlgorithm::Sha256,
+        Cursor::new(payload),
+    )
+    .expect("raw cert-only sign");
+    let sig_cert_b64 = B64.encode(sig_cert.to_armored_string(Default::default()).unwrap().as_bytes());
+    let mut store_co = SessionStore::default();
+    store_co.upsert_public(cert_only_key.to_public_key(), true);
+    let ver_co = verify_detached(
+        &store_co,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(payload),
+            signature_b64: sig_cert_b64,
+            now_secs: TEST_NOW + 100,
+        },
+    )
+    .expect("verify returns result");
+    assert_eq!(
+        ver_co.status, "invalid",
+        "certify-only key without Sign flag must be rejected during verification"
+    );
+}
+
+#[test]
+fn test_rejects_v1_seipd_tamper_truncation_and_multi_seipd_smuggling() {
+    let mut store = SessionStore::default();
+    let alice = gen_test_key(&mut store, Some("alice"), "alice-passphrase-1234");
+
+    let enc_v1 = encrypt_message(
+        &store,
+        EncryptRequest {
+            plaintext_b64: B64.encode(b"Legacy v1 integrity check payload"),
+            recipient_fingerprints: vec![alice.summary.fingerprint.clone()],
+            sign_fingerprint: None,
+            sign_passphrase: None,
+            profile: Some("compat_seipd_v1".into()),
+            armor: false,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("encrypt v1");
+    let raw_v1 = B64.decode(&enc_v1.output_b64).unwrap();
+
+    // 1. Tampered v1-SEIPD+MDC must fail
+    let mut tampered = raw_v1.clone();
+    let idx = tampered.len() - 4;
+    tampered[idx] ^= 0x01;
+    assert!(decrypt_message(
+        &store,
+        DecryptRequest {
+            input_b64: B64.encode(&tampered),
+            passphrase: Some("alice-passphrase-1234".into()),
+            allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .is_err());
+
+    // 2. Truncated v1-SEIPD+MDC must fail
+    let truncated = &raw_v1[..raw_v1.len() - 10];
+    assert!(decrypt_message(
+        &store,
+        DecryptRequest {
+            input_b64: B64.encode(truncated),
+            passphrase: Some("alice-passphrase-1234".into()),
+            allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .is_err());
+
+    // 3. Smuggling two SEIPD packets (v1 followed by v2) must be rejected
+    let enc_v2 = encrypt_message(
+        &store,
+        EncryptRequest {
+            plaintext_b64: B64.encode(b"v2 payload"),
+            recipient_fingerprints: vec![alice.summary.fingerprint.clone()],
+            sign_fingerprint: None,
+            sign_passphrase: None,
+            profile: Some("rfc9580".into()),
+            armor: false,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("encrypt v2");
+    let mut combined = raw_v1;
+    combined.extend_from_slice(&B64.decode(&enc_v2.output_b64).unwrap());
+    let err = decrypt_message(
+        &store,
+        DecryptRequest {
+            input_b64: B64.encode(&combined),
+            passphrase: Some("alice-passphrase-1234".into()),
+            allow_legacy_seipd_v1: false,
+            now_secs: TEST_NOW,
+        },
+    )
+    .err()
+    .expect("multiple SEIPD packets must be rejected");
+    assert!(err.contains("SEIPD"), "unexpected error: {err}");
 }

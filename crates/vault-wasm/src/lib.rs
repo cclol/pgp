@@ -87,7 +87,7 @@ fn dispatch_json(req_bytes: &[u8]) -> Zeroizing<Vec<u8>> {
         Err(e) => RpcResponse {
             ok: false,
             data: None,
-            error: Some(format!("Ungültige Anfrage: {e}")),
+            error: Some(format!("Invalid request: {e}")),
         },
         Ok(req) => SESSION.with(|cell| {
             let mut store = cell.borrow_mut();
@@ -138,7 +138,7 @@ fn dispatch_json(req_bytes: &[u8]) -> Zeroizing<Vec<u8>> {
     };
 
     Zeroizing::new(serde_json::to_vec(&resp).unwrap_or_else(|_| {
-        br#"{"ok":false,"error":"Serialisierungsfehler"}"#.to_vec()
+        br#"{"ok":false,"error":"Serialization error"}"#.to_vec()
     }))
 }
 
