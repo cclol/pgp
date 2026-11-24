@@ -30,10 +30,13 @@ worker-src blob:
 
 | Area | Selected Profile | Notes |
 |---|---|---|
-| Key generation | **RFC 9580 v6**: Primary **Ed25519** (Certify + Sign), Subkey **X25519** (Encrypt All) | Pseudonymous / empty User ID supported |
-| Private key protection | Mandatory passphrase (≥ 8 chars, 12+ recommended), **Argon2** (`t=3, p=4, m=2^16 KiB = 64 MiB`) + **AES-256-OCB** | No unprotected private key export |
+| Key generation (Modern, default) | **RFC 9580 v6**: Primary **Ed25519** (Certify + Sign), Subkey **X25519** (EncryptComms + EncryptStorage) | Pseudonymous / empty User ID supported |
+| Key generation (Compatibility) | **OpenPGP v4**: Primary **RSA-4096** (Certify + Sign), Subkey **RSA-4096** (EncryptComms + EncryptStorage) | Requires non-empty User ID (v4 positive certification); explicitly designed for Kleopatra / GnuPG 2.2 & 2.4 |
+| Private key protection (Modern) | Mandatory passphrase (≥ 8 chars, 12+ recommended), **S2K Usage 253 (AEAD)** + **Argon2** (`t=3, p=4, m=2^16 KiB = 64 MiB`) + **AES-256-OCB** | No unprotected private key export |
+| Private key protection (Compatibility) | Mandatory passphrase (≥ 8 chars, 12+ recommended), **S2K Usage 254 (CFB + 20-byte SHA-1 checksum)** + **Iterated & Salted S2K** (`SHA-256`, `count=224` / `65,536,000` octets) + **AES-256-CFB** | Standard RFC 4880 protection format natively imported and unlocked by Kleopatra / GnuPG 2.2 & 2.4 |
+| Signing & signature verification hash | **Signing:** always **SHA-256** (both Modern v6 and Compatibility v4 profiles; v4 signatures carry hashed `IssuerFingerprint` and unhashed `IssuerKeyId`). **Verification:** supports **SHA-256** and **SHA-512** (plus SHA-384) on RSA-4096 and Ed25519 keys | Hash algorithm is kept separate from key generation; no signature hash selector UI |
 | Encryption (default) | **RFC 9580 v2-SEIPD** + **AES-256** + **AEAD-OCB** (`ChunkSize::C4KiB`) + **anonymous v6-PKESK** (omitted recipient fingerprint) | **No silent fallback** to legacy formats |
-| Encryption (compatibility) | Explicitly selectable: **v1-SEIPD+MDC** + **AES-256** + **anonymous v3-PKESK** (`KeyId::WILDCARD = 0000000000000000`) | For clients lacking RFC 9580 v2-SEIPD (e.g., older GnuPG/Kleopatra) |
+| Encryption (compatibility) | Explicitly selectable: **v1-SEIPD+MDC** + **AES-256** + **anonymous v3-PKESK** (`KeyId::WILDCARD = 0000000000000000`) | For clients lacking RFC 9580 v2-SEIPD (e.g., Kleopatra / GnuPG 2.2 & 2.4) |
 | Decryption (read) | Default: **v2-SEIPD**; **v1-SEIPD+MDC** only with explicit read-profile opt-in | **Unauthenticated SED (Tag 9) and multi-SEIPD packets are always rejected** |
 | Metadata | Literal filename `""`, literal timestamp `0`, `DataMode::Binary`; ASCII Armor without `Version:` or `Comment:` headers | Audited directly on serialized packets via `packet_check::audit_message_packets` |
 | Integrity before release | Full read & verification of the AEAD tag / MDC before releasing plaintext | On error or abort, partial buffers are zeroized via `Zeroizing` |

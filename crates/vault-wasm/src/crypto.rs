@@ -84,6 +84,7 @@ impl CryptoRng for VaultRng {}
 pub struct KeyGenRequest {
     pub user_id: Option<String>,
     pub passphrase: String,
+    pub profile: Option<String>, // "modern" (default) | "compat_rsa4096"
     pub now_secs: u32,
 }
 
@@ -235,8 +236,24 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         );
     }
 
+    let profile = req.profile.as_deref().unwrap_or("modern");
+    match profile {
+        "modern" | "rfc9580" => generate_key_modern_v6(store, req.user_id, passphrase, req.now_secs),
+        "compat_rsa4096" => generate_key_compat_v4_rsa4096(store, req.user_id, passphrase, req.now_secs),
+        other => Err(format!(
+            "Unsupported key generation profile: '{other}'. Expected 'modern' or 'compat_rsa4096'."
+        )),
+    }
+}
+
+fn generate_key_modern_v6(
+    store: &mut SessionStore,
+    user_id: Option<String>,
+    passphrase: Zeroizing<String>,
+    now_secs: u32,
+) -> Result<KeyGenResponse, String> {
     let mut rng = VaultRng;
-    let created = Timestamp::from_secs(req.now_secs);
+    let created = Timestamp::from_secs(now_secs);
     let pw = Password::from(passphrase.as_str());
 
     // 1. Generate RFC 9580 v6 Primary Key (Ed25519)
@@ -326,7 +343,7 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
 
     // 3. Optional User ID with explicit timestamp self-signature
     let mut users = Vec::new();
-    if let Some(uid_str) = req.user_id {
+    if let Some(uid_str) = user_id {
         let trimmed = uid_str.trim();
         if !trimmed.is_empty() {
             let uid = UserId::from_str(PacketHeaderVersion::New, trimmed)
@@ -439,7 +456,211 @@ pub fn generate_key(store: &mut SessionStore, req: KeyGenRequest) -> Result<KeyG
         summary,
         public_key_armored,
         secret_key_armored: secret_key_armored.to_string(),
-        profile: "RFC 9580 v6 (Ed25519 + X25519, Argon2 + AES-256-OCB)".into(),
+        profile: "Modern — OpenPGP v6 (Ed25519 + X25519, Argon2 + AES-256-OCB)".into(),
+    })
+}
+
+fn generate_key_compat_v4_rsa4096(
+    store: &mut SessionStore,
+    user_id: Option<String>,
+    passphrase: Zeroizing<String>,
+    now_secs: u32,
+) -> Result<KeyGenResponse, String> {
+    let uid_str = user_id.unwrap_or_default();
+    let trimmed_uid = uid_str.trim();
+    if trimmed_uid.is_empty() {
+        return Err(
+            "Compatibility failure: OpenPGP v4 (RSA-4096) keys require a non-empty User ID for Kleopatra / GnuPG import and self-certification."
+                .into(),
+        );
+    }
+
+    let mut rng = VaultRng;
+    let created = Timestamp::from_secs(now_secs);
+    let pw = Password::from(passphrase.as_str());
+
+    // 1. Generate OpenPGP v4 Primary Key (RSA-4096) for Certification + Signing
+    //    Protected with S2K Usage 254 (CFB + SHA-1 checksum), AES-256, Iterated & Salted S2K (SHA-256, count=224).
+    let (pub_params, sec_params_raw) = KeyType::Rsa(4096)
+        .generate(&mut rng)
+        .map_err(|e| format!("RSA-4096 primary key generation failed: {e}"))?;
+    let primary_pub_inner = PubKeyInner::new(
+        KeyVersion::V4,
+        KeyType::Rsa(4096).to_alg(),
+        created,
+        None,
+        pub_params,
+    )
+    .map_err(|e| format!("Primary key header creation failed: {e}"))?;
+    let primary_pub_pkt = PacketPublicKey::from_inner(primary_pub_inner)
+        .map_err(|e| format!("Primary public key packet failed: {e}"))?;
+    let primary_s2k = S2kParams::new_default(&mut rng, KeyVersion::V4);
+    let primary_sec_params = match &sec_params_raw {
+        SecretParams::Plain(plain) => SecretParams::Encrypted(
+            plain
+                .encrypt(
+                    passphrase.as_bytes(),
+                    primary_s2k,
+                    &primary_pub_pkt,
+                    Some(Tag::SecretKey),
+                )
+                .map_err(|e| format!("Primary key encryption failed: {e}"))?,
+        ),
+        other => other.clone(),
+    };
+    let primary_key = PacketSecretKey::new(primary_pub_pkt.clone(), primary_sec_params)
+        .map_err(|e| format!("Primary secret key packet failed: {e}"))?;
+
+    // 2. Primary User ID + v4 CertPositive self-signature carrying KeyFlags (Certify + Sign) and preferences
+    let mut keyflags = KeyFlags::default();
+    keyflags.set_certify(true);
+    keyflags.set_sign(true);
+
+    let mut features = Features::new();
+    features.set_seipd_v1(true);
+
+    let uid = UserId::from_str(PacketHeaderVersion::New, trimmed_uid)
+        .map_err(|e| format!("Invalid User ID: {e}"))?;
+    let mut uid_cfg = SignatureConfig::v4(
+        SignatureType::CertPositive,
+        primary_key.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    uid_cfg.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::IssuerFingerprint(primary_key.fingerprint()))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::KeyFlags(keyflags))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::Features(features))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::PreferredSymmetricAlgorithms(
+            [
+                SymmetricKeyAlgorithm::AES256,
+                SymmetricKeyAlgorithm::AES192,
+                SymmetricKeyAlgorithm::AES128,
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::PreferredHashAlgorithms(
+            [
+                HashAlgorithm::Sha256,
+                HashAlgorithm::Sha512,
+                HashAlgorithm::Sha384,
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::PreferredCompressionAlgorithms(
+            [CompressionAlgorithm::Uncompressed].into_iter().collect(),
+        ))
+        .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::IsPrimary(true))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+    ];
+    uid_cfg.unhashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerKeyId(primary_key.legacy_key_id()))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+    ];
+
+    let primary_pub_pkt = primary_key.public_key();
+    let uid_sig = uid_cfg
+        .sign_certification(&primary_key, &primary_pub_pkt, &pw, uid.tag(), &uid)
+        .map_err(|e| format!("User ID certification signature failed: {e}"))?;
+    let users = vec![SignedUser::new(uid, vec![uid_sig])];
+
+    // 3. Generate OpenPGP v4 Encryption Subkey (RSA-4096) + v4 SubkeyBinding Signature
+    let (sub_pub_params, sub_sec_raw) = KeyType::Rsa(4096)
+        .generate(&mut rng)
+        .map_err(|e| format!("RSA-4096 encryption subkey generation failed: {e}"))?;
+    let sub_pub_inner = PubKeyInner::new(
+        KeyVersion::V4,
+        KeyType::Rsa(4096).to_alg(),
+        created,
+        None,
+        sub_pub_params,
+    )
+    .map_err(|e| format!("Subkey header creation failed: {e}"))?;
+    let sub_pub_pkt = PacketPublicSubkey::from_inner(sub_pub_inner)
+        .map_err(|e| format!("Subkey public packet failed: {e}"))?;
+    let sub_s2k = S2kParams::new_default(&mut rng, KeyVersion::V4);
+    let sub_sec_params = match &sub_sec_raw {
+        SecretParams::Plain(plain) => SecretParams::Encrypted(
+            plain
+                .encrypt(
+                    passphrase.as_bytes(),
+                    sub_s2k,
+                    &sub_pub_pkt,
+                    Some(Tag::SecretSubkey),
+                )
+                .map_err(|e| format!("Subkey encryption failed: {e}"))?,
+        ),
+        other => other.clone(),
+    };
+    let sub_key = PacketSecretSubkey::new(sub_pub_pkt, sub_sec_params)
+        .map_err(|e| format!("Subkey secret packet failed: {e}"))?;
+
+    let mut sub_flags = KeyFlags::default();
+    sub_flags.set_encrypt_comms(true);
+    sub_flags.set_encrypt_storage(true);
+
+    let mut sub_cfg = SignatureConfig::v4(
+        SignatureType::SubkeyBinding,
+        primary_key.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    sub_cfg.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::IssuerFingerprint(primary_key.fingerprint()))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+        Subpacket::regular(SubpacketData::KeyFlags(sub_flags))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+    ];
+    sub_cfg.unhashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::IssuerKeyId(primary_key.legacy_key_id()))
+            .map_err(|e| format!("Subpacket error: {e}"))?,
+    ];
+    let sub_binding = sub_cfg
+        .sign_subkey_binding(&primary_key, &primary_pub_pkt, &pw, &sub_key.public_key())
+        .map_err(|e| format!("Subkey binding signature failed: {e}"))?;
+
+    let details = SignedKeyDetails::new(vec![], vec![], users, vec![]);
+    let secret_key = SignedSecretKey::new(
+        primary_key,
+        details,
+        vec![],
+        vec![SignedSecretSubKey::new(sub_key, vec![sub_binding])],
+    );
+
+    // Verify self-signatures and subkey bindings immediately
+    secret_key
+        .verify_bindings()
+        .map_err(|e| format!("Self-signature verification failed: {e}"))?;
+
+    let public_key = secret_key.to_public_key();
+    let armor_opts = ArmorOptions::default(); // headers: None (no Version/Comment)
+
+    let public_key_armored = public_key
+        .to_armored_string(armor_opts.clone())
+        .map_err(|e| format!("Public key export failed: {e}"))?;
+    let secret_key_armored = Zeroizing::new(
+        secret_key
+            .to_armored_string(armor_opts)
+            .map_err(|e| format!("Secret key export failed: {e}"))?,
+    );
+
+    let summary = store.upsert_secret(secret_key, true);
+
+    Ok(KeyGenResponse {
+        summary,
+        public_key_armored,
+        secret_key_armored: secret_key_armored.to_string(),
+        profile: "Compatibility — OpenPGP v4 (RSA-4096 + RSA-4096, S2K Iterated+Salted SHA-256 + AES-256-CFB)".into(),
     })
 }
 

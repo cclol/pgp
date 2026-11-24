@@ -109,6 +109,7 @@ function runChromeTest() {
               await waitFor(() => !document.getElementById("kg-result").hidden);
               const validPubKey = document.getElementById("kg-pub").value;
               const validSecKey = document.getElementById("kg-sec").value;
+              await waitFor(() => keyCount() === "1");
 
               // Encrypt a known secret message
               document.querySelector('[data-tab="encrypt"]').click();
@@ -372,6 +373,105 @@ function runChromeTest() {
               await waitFor(() => keyCount() === "1");
               const test5Recovered = keyCount() === "1" && isWorkerReady();
 
+              // ------------------------------------------------------------------
+              // TEST 6: Delayed Worker rpc_result for GenerateKey (compat_rsa4096)
+              //         arriving AFTER Cancel (btn-abort) or Wipe (btn-wipe) must
+              //         never restore keys or expose a download.
+              // ------------------------------------------------------------------
+              document.getElementById("btn-wipe").click();
+              await waitFor(() => keyCount() === "0" && isWorkerReady());
+
+              window.Worker = function InterceptedKeygenWorker(url) {
+                const real = new OrigWorker(url);
+                let userOnMessage = null;
+                const wrapper = {
+                  postMessage(data, transfer) {
+                    return transfer ? real.postMessage(data, transfer) : real.postMessage(data);
+                  },
+                  terminate() {
+                    return real.terminate();
+                  },
+                  set onmessage(fn) {
+                    userOnMessage = fn;
+                    real.onmessage = (ev) => {
+                      if (holdNextRpcResult && ev.data && ev.data.type === "rpc_result") {
+                        holdNextRpcResult = false;
+                        heldRpcEvents.push({ ev, targetWrapper: wrapper });
+                        return;
+                      }
+                      if (userOnMessage) userOnMessage(ev);
+                    };
+                  },
+                  get onmessage() {
+                    return userOnMessage;
+                  },
+                  set onerror(fn) {
+                    real.onerror = fn;
+                  },
+                  get onerror() {
+                    return real.onerror;
+                  },
+                };
+                workers.push(wrapper);
+                return wrapper;
+              };
+
+              window.dispatchEvent(new Event("pagehide"));
+              await waitFor(() => isWorkerReady());
+
+              // Start keygen and hold the rpc_result
+              holdNextRpcResult = true;
+              heldRpcEvents = [];
+              document.querySelector('[data-tab="keygen"]').click();
+              document.getElementById("kg-profile").value = "modern";
+              document.getElementById("kg-uid").value = "cancel-keygen-test";
+              document.getElementById("kg-pw").value = "cancel-keygen-pass-99";
+              document.getElementById("kg-pw2").value = "cancel-keygen-pass-99";
+              document.getElementById("btn-keygen").click();
+              await waitFor(() => heldRpcEvents.length === 1);
+
+              // Click Cancel / Abort operation (btn-abort)
+              const prevW = workers.length;
+              document.getElementById("btn-abort").click();
+              await waitFor(() => workers.length > prevW && isWorkerReady());
+              const newWorkerAfterAbort = workers[workers.length - 1];
+
+              // Deliver late GenerateKey rpc_result to both old and new Worker handlers
+              const staleKgEv = heldRpcEvents[0].ev;
+              if (heldRpcEvents[0].targetWrapper.onmessage) {
+                heldRpcEvents[0].targetWrapper.onmessage(staleKgEv);
+              }
+              if (newWorkerAfterAbort.onmessage) {
+                newWorkerAfterAbort.onmessage(staleKgEv);
+              }
+              await sleep(250);
+
+              let test6DownloadCreated = false;
+              URL.createObjectURL = function () {
+                test6DownloadCreated = true;
+                return origCreate.apply(this, arguments);
+              };
+              document.getElementById("btn-kg-pub-dl").click();
+              document.getElementById("btn-kg-sec-dl").click();
+              URL.createObjectURL = origCreate;
+
+              const test6 = {
+                staleHadRealKey: Boolean(
+                  staleKgEv.data &&
+                  staleKgEv.data.result &&
+                  staleKgEv.data.result.ok === true &&
+                  staleKgEv.data.result.data &&
+                  staleKgEv.data.result.data.secret_key_armored
+                ),
+                kgResultHidden: document.getElementById("kg-result").hidden,
+                kgPubEmpty: document.getElementById("kg-pub").value === "",
+                kgSecEmpty: document.getElementById("kg-sec").value === "",
+                downloadBlobCreated: test6DownloadCreated,
+                keyCountAfterCancel: keyCount(),
+              };
+
+              window.Worker = OrigWorker;
+
               return {
                 test1: {
                   abortCalled,
@@ -386,6 +486,7 @@ function runChromeTest() {
                 test5: {
                   recoveredAfterDoubleWipe: test5Recovered,
                 },
+                test6,
               };
             })()`,
           },
@@ -427,7 +528,13 @@ runChromeTest()
       res.test4.decOutputEmpty === true &&
       res.test4.downloadBlobCreated === false &&
       res.test4.keyCountAfterWipe === "0" &&
-      res.test5.recoveredAfterDoubleWipe === true;
+      res.test5.recoveredAfterDoubleWipe === true &&
+      res.test6.staleHadRealKey === true &&
+      res.test6.kgResultHidden === true &&
+      res.test6.kgPubEmpty === true &&
+      res.test6.kgSecEmpty === true &&
+      res.test6.downloadBlobCreated === false &&
+      res.test6.keyCountAfterCancel === "0";
     if (!ok) {
       console.error("FAIL: One or more wipe regression assertions failed!");
       process.exit(1);

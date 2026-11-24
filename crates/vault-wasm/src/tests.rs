@@ -18,6 +18,7 @@ fn gen_test_key(store: &mut SessionStore, uid: Option<&str>, pw: &str) -> crate:
         KeyGenRequest {
             user_id: uid.map(String::from),
             passphrase: pw.to_string(),
+            profile: Some("modern".into()),
             now_secs: TEST_NOW,
         },
     )
@@ -34,14 +35,25 @@ fn test_keygen_v6_passphrase_and_armor_headers() {
         KeyGenRequest {
             user_id: Some("pseudonym".into()),
             passphrase: "short".into(),
+            profile: None,
             now_secs: TEST_NOW,
         },
     );
     assert!(err.is_err());
 
-    // Pseudonymous / empty UID supported on v6
-    let kp = gen_test_key(&mut store, None, "correct-horse-battery-staple");
+    // Pseudonymous / empty UID supported on v6 (default profile when profile is None)
+    let kp = generate_key(
+        &mut store,
+        KeyGenRequest {
+            user_id: None,
+            passphrase: "correct-horse-battery-staple".into(),
+            profile: None,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("default modern keygen should succeed");
     assert_eq!(kp.summary.version, "V6");
+    assert_eq!(kp.summary.algorithm, "Ed25519");
     assert!(kp.summary.has_secret);
     assert!(kp.summary.can_encrypt);
     assert!(kp.summary.can_sign);
@@ -1218,4 +1230,428 @@ fn test_rejects_v1_seipd_tamper_truncation_and_multi_seipd_smuggling() {
     .err()
     .expect("multiple SEIPD packets must be rejected");
     assert!(err.contains("SEIPD"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_compat_rsa4096_keygen_packet_inspection_and_sha256_sha512_interop() {
+    use pgp::composed::{
+        Deserializable, DetachedSignature, SignedPublicKey, SignedSecretKey, SubpacketConfig,
+    };
+    use pgp::crypto::{
+        aead::AeadAlgorithm, hash::HashAlgorithm, public_key::PublicKeyAlgorithm,
+        sym::SymmetricKeyAlgorithm,
+    };
+    use pgp::packet::{SignatureVersion, SubpacketData};
+    use pgp::ser::Serialize;
+    use pgp::types::{KeyDetails, KeyVersion, Password, PublicParams, S2kParams, SecretParams};
+    use std::io::Cursor;
+
+    let rsa_modulus_bits = |rsa_pub: &pgp::types::RsaPublicParams| -> usize {
+        let mut buf = Vec::new();
+        rsa_pub.to_writer(&mut buf).expect("serialize RSA public params");
+        u16::from_be_bytes([buf[0], buf[1]]) as usize
+    };
+
+    let mut store = SessionStore::default();
+
+    // 1. Explicit compatibility failure checks:
+    //    (a) Missing / short passphrase rejected
+    let err_pw = generate_key(
+        &mut store,
+        KeyGenRequest {
+            user_id: Some("Alice RSA <alice@example.invalid>".into()),
+            passphrase: "short".into(),
+            profile: Some("compat_rsa4096".into()),
+            now_secs: TEST_NOW,
+        },
+    );
+    assert!(err_pw.is_err(), "short passphrase must be rejected");
+
+    //    (b) Empty User ID rejected explicitly on v4 Compatibility profile
+    let err_uid = generate_key(
+        &mut store,
+        KeyGenRequest {
+            user_id: Some("   ".into()),
+            passphrase: "kleopatra-rsa4096-passphrase".into(),
+            profile: Some("compat_rsa4096".into()),
+            now_secs: TEST_NOW,
+        },
+    )
+    .err()
+    .expect("empty User ID must be rejected for v4 Compatibility profile");
+    assert!(
+        err_uid.contains("User ID"),
+        "expected explicit User ID error, got: {err_uid}"
+    );
+
+    //    (c) Unknown profile rejected explicitly
+    let err_prof = generate_key(
+        &mut store,
+        KeyGenRequest {
+            user_id: Some("Alice".into()),
+            passphrase: "kleopatra-rsa4096-passphrase".into(),
+            profile: Some("unknown_profile".into()),
+            now_secs: TEST_NOW,
+        },
+    );
+    assert!(err_prof.is_err());
+
+    // 2. Verify Modern (default) profile still uses v6 Ed25519 + X25519 and Argon2 + AES-256-OCB
+    let modern = gen_test_key(&mut store, Some("Modern User"), "modern-v6-passphrase-123");
+    let (modern_sk, _) =
+        SignedSecretKey::from_string(&modern.secret_key_armored).expect("parse modern sk");
+    assert_eq!(modern_sk.primary_key.version(), KeyVersion::V6);
+    assert_eq!(modern_sk.primary_key.algorithm(), PublicKeyAlgorithm::Ed25519);
+    assert_eq!(modern_sk.secret_subkeys.len(), 1);
+    assert_eq!(modern_sk.secret_subkeys[0].key.version(), KeyVersion::V6);
+    assert_eq!(
+        modern_sk.secret_subkeys[0].key.algorithm(),
+        PublicKeyAlgorithm::X25519
+    );
+    match modern_sk.primary_key.secret_params() {
+        SecretParams::Encrypted(enc) => match enc.string_to_key_params() {
+            S2kParams::Aead {
+                sym_alg,
+                aead_mode,
+                s2k: StringToKey::Argon2 { t, p, m_enc, .. },
+                ..
+            } => {
+                assert_eq!(*sym_alg, SymmetricKeyAlgorithm::AES256);
+                assert_eq!(*aead_mode, AeadAlgorithm::Ocb);
+                assert_eq!((*t, *p, *m_enc), (3, 4, 16));
+            }
+            other => panic!("expected Argon2 + AES-256-OCB on modern v6 key, got {other:?}"),
+        },
+        other => panic!("expected encrypted modern secret key, got {other:?}"),
+    }
+
+    // 3. Generate Compatibility OpenPGP v4 RSA-4096 key and inspect packets, algorithms, Key Flags, and S2K protection
+    let compat_pw = "kleopatra-rsa4096-passphrase";
+    let compat = generate_key(
+        &mut store,
+        KeyGenRequest {
+            user_id: Some("Alice Compat <alice-rsa@example.invalid>".into()),
+            passphrase: compat_pw.into(),
+            profile: Some("compat_rsa4096".into()),
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("generate compat_rsa4096 key");
+
+    assert_eq!(compat.summary.version, "V4");
+    assert_eq!(compat.summary.algorithm, "RSA");
+    assert_eq!(compat.summary.fingerprint.len(), 40); // v4 20-octet SHA-1 fingerprint = 40 hex chars
+    assert!(compat.summary.has_secret);
+    assert!(compat.summary.can_encrypt);
+    assert!(compat.summary.can_sign);
+    assert!(!armor_has_forbidden_headers(&compat.public_key_armored));
+    assert!(!armor_has_forbidden_headers(&compat.secret_key_armored));
+
+    let (sk, _) = SignedSecretKey::from_string(&compat.secret_key_armored).expect("parse compat sk");
+    let (pk, _) = SignedPublicKey::from_string(&compat.public_key_armored).expect("parse compat pk");
+    sk.verify_bindings().expect("valid secret key bindings");
+    pk.verify_bindings().expect("valid public key bindings");
+
+    // Inspect Primary Key packet: v4, RSA-4096 (4096 bits)
+    assert_eq!(sk.primary_key.version(), KeyVersion::V4);
+    assert_eq!(sk.primary_key.algorithm(), PublicKeyAlgorithm::RSA);
+    match sk.primary_key.public_params() {
+        PublicParams::RSA(rsa_pub) => {
+            assert_eq!(
+                rsa_modulus_bits(rsa_pub),
+                4096,
+                "primary RSA modulus must be 4096 bits"
+            );
+        }
+        other => panic!("expected RSA public params, got {other:?}"),
+    }
+
+    // Inspect Primary Key User ID self-certification signature & Key Flags (Certify + Sign)
+    assert!(sk.details.direct_signatures.is_empty(), "v4 key uses User ID self-certification");
+    assert_eq!(sk.details.users.len(), 1);
+    let uid_sig = &sk.details.users[0].signatures[0];
+    assert_eq!(uid_sig.version(), SignatureVersion::V4);
+    assert_eq!(uid_sig.hash_alg(), Some(HashAlgorithm::Sha256));
+    let pri_flags = uid_sig.key_flags();
+    assert!(pri_flags.certify(), "primary RSA key must have Certify flag");
+    assert!(pri_flags.sign(), "primary RSA key must have Sign flag");
+    assert!(!pri_flags.encrypt_comms(), "primary RSA key must not have EncryptComms flag");
+    assert!(!pri_flags.encrypt_storage(), "primary RSA key must not have EncryptStorage flag");
+
+    // Inspect Encryption Subkey packet: v4, RSA-4096 (4096 bits), SubkeyBinding signature & Key Flags (EncryptComms + EncryptStorage)
+    assert_eq!(sk.secret_subkeys.len(), 1);
+    let sub = &sk.secret_subkeys[0];
+    assert_eq!(sub.key.version(), KeyVersion::V4);
+    assert_eq!(sub.key.algorithm(), PublicKeyAlgorithm::RSA);
+    match sub.key.public_params() {
+        PublicParams::RSA(rsa_sub) => {
+            assert_eq!(
+                rsa_modulus_bits(rsa_sub),
+                4096,
+                "subkey RSA modulus must be 4096 bits"
+            );
+        }
+        other => panic!("expected RSA subkey public params, got {other:?}"),
+    }
+    assert_eq!(sub.signatures.len(), 1);
+    let sub_sig = &sub.signatures[0];
+    assert_eq!(sub_sig.version(), SignatureVersion::V4);
+    assert_eq!(sub_sig.hash_alg(), Some(HashAlgorithm::Sha256));
+    let sub_flags = sub_sig.key_flags();
+    assert!(!sub_flags.certify(), "encryption subkey must not have Certify flag");
+    assert!(!sub_flags.sign(), "encryption subkey must not have Sign flag");
+    assert!(sub_flags.encrypt_comms(), "encryption subkey must have EncryptComms flag");
+    assert!(sub_flags.encrypt_storage(), "encryption subkey must have EncryptStorage flag");
+
+    // Inspect Private-Key Protection on both primary key and subkey:
+    // S2K Usage 254 (S2kParams::Cfb) + AES-256 + IteratedAndSalted (SHA-256, count=224) + 20-byte SHA-1 checksum
+    for (label, sec_params) in [
+        ("primary", sk.primary_key.secret_params()),
+        ("subkey", sub.key.secret_params()),
+    ] {
+        match sec_params {
+            SecretParams::Encrypted(enc) => {
+                assert_eq!(
+                    enc.string_to_key_id(),
+                    254,
+                    "{label} must use S2K Usage 254 (CFB + SHA-1 checksum)"
+                );
+                assert_eq!(enc.checksum().len(), 20, "{label} must use 20-octet SHA-1 checksum");
+                match enc.string_to_key_params() {
+                    S2kParams::Cfb {
+                        sym_alg,
+                        s2k:
+                            StringToKey::IteratedAndSalted {
+                                hash_alg, count, ..
+                            },
+                        iv,
+                    } => {
+                        assert_eq!(*sym_alg, SymmetricKeyAlgorithm::AES256);
+                        assert_eq!(*hash_alg, HashAlgorithm::Sha256);
+                        assert_eq!(*count, 224);
+                        assert_eq!(iv.len(), 16);
+                    }
+                    other => panic!("expected Cfb + IteratedAndSalted on {label}, got {other:?}"),
+                }
+            }
+            other => panic!("expected encrypted secret params on {label}, got {other:?}"),
+        }
+    }
+
+    // 4. Test re-importing the exported RSA-4096 secret key into a fresh vault session,
+    //    signing with it (confirming the vault emits SHA-256), and encrypting/decrypting with both
+    //    v1-SEIPD+MDC (Kleopatra compatibility write profile) and v2-SEIPD.
+    let mut fresh_store = SessionStore::default();
+    let imp = import_keys(
+        &mut fresh_store,
+        ImportKeyRequest {
+            data_b64: B64.encode(compat.secret_key_armored.as_bytes()),
+        },
+    )
+    .expect("import exported v4 RSA-4096 secret key into fresh session");
+    assert_eq!(imp.imported.len(), 1);
+    assert_eq!(imp.imported[0].fingerprint, compat.summary.fingerprint);
+
+    // Detached sign with the RSA-4096 key -> inspect signature hash algorithm (must be SHA-256)
+    let msg_bytes = b"Vault RSA-4096 compatibility test message";
+    let det_sig = sign_detached(
+        &fresh_store,
+        SignDetachedRequest {
+            data_b64: B64.encode(msg_bytes),
+            sign_fingerprint: compat.summary.fingerprint.clone(),
+            passphrase: compat_pw.into(),
+            armor: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("detached sign with RSA-4096 key");
+    let (parsed_det, _) =
+        DetachedSignature::from_string(det_sig.signature_armored.as_ref().unwrap())
+            .expect("parse detached sig");
+    assert_eq!(parsed_det.signature.version(), SignatureVersion::V4);
+    assert_eq!(parsed_det.signature.hash_alg(), Some(HashAlgorithm::Sha256));
+    let has_issuer_fp = parsed_det
+        .signature
+        .config()
+        .unwrap()
+        .hashed_subpackets()
+        .any(|sp| matches!(sp.data, SubpacketData::IssuerFingerprint(_)));
+    let has_issuer_key_id = parsed_det
+        .signature
+        .config()
+        .unwrap()
+        .unhashed_subpackets()
+        .any(|sp| matches!(sp.data, SubpacketData::IssuerKeyId(_)));
+    assert!(has_issuer_fp, "v4 signature must include hashed IssuerFingerprint");
+    assert!(has_issuer_key_id, "v4 signature must include unhashed IssuerKeyId for GnuPG/Kleopatra");
+
+    // Verify SHA-256 detached signature produced by the vault
+    let ver_sha256 = verify_detached(
+        &fresh_store,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(msg_bytes),
+            signature_b64: det_sig.signature_b64,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("verify SHA-256 RSA-4096 detached signature");
+    assert_eq!(ver_sha256.status, "valid");
+
+    // Create a SHA-512 detached signature with the RSA-4096 primary key (as Kleopatra/GnuPG often emits)
+    // and verify that the vault verifies SHA-512 RSA-4096 signatures cleanly!
+    let mut rng = crate::crypto::VaultRng;
+    let subpackets_512 = SubpacketConfig::UserDefined {
+        hashed: vec![
+            pgp::packet::Subpacket::regular(SubpacketData::IssuerFingerprint(
+                sk.primary_key.fingerprint(),
+            ))
+            .unwrap(),
+            pgp::packet::Subpacket::regular(SubpacketData::SignatureCreationTime(
+                pgp::types::Timestamp::from_secs(TEST_NOW),
+            ))
+            .unwrap(),
+        ],
+        unhashed: vec![pgp::packet::Subpacket::regular(SubpacketData::IssuerKeyId(
+            sk.primary_key.legacy_key_id(),
+        ))
+        .unwrap()],
+    };
+    let sig_sha512 = DetachedSignature::sign_binary_data_with_subpackets(
+        &mut rng,
+        &sk.primary_key,
+        &Password::from(compat_pw),
+        HashAlgorithm::Sha512,
+        Cursor::new(msg_bytes),
+        subpackets_512,
+    )
+    .expect("sign with SHA-512");
+    assert_eq!(sig_sha512.signature.hash_alg(), Some(HashAlgorithm::Sha512));
+    let sig_sha512_armored = sig_sha512.to_armored_string(Default::default()).unwrap();
+
+    let ver_sha512 = verify_detached(
+        &fresh_store,
+        VerifyDetachedRequest {
+            data_b64: B64.encode(msg_bytes),
+            signature_b64: B64.encode(sig_sha512_armored.as_bytes()),
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("verify SHA-512 RSA-4096 detached signature");
+    assert_eq!(
+        ver_sha512.status, "valid",
+        "vault must verify SHA-512 signatures with RSA-4096 keys"
+    );
+
+    // Encrypt + inline sign to the RSA-4096 key using Compatibility write profile (v1-SEIPD + v3-PKESK)
+    // and decrypt + verify in the vault
+    let enc_compat = encrypt_message(
+        &fresh_store,
+        EncryptRequest {
+            plaintext_b64: B64.encode(msg_bytes),
+            recipient_fingerprints: vec![compat.summary.fingerprint.clone()],
+            sign_fingerprint: Some(compat.summary.fingerprint.clone()),
+            sign_passphrase: Some(compat_pw.into()),
+            profile: Some("compat_seipd_v1".into()),
+            armor: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("encrypt compat_seipd_v1 to RSA-4096 subkey");
+    assert_eq!(enc_compat.packet_audit.seipd_version, Some(1));
+    assert_eq!(enc_compat.packet_audit.pkesk_versions, vec![3]);
+    assert!(enc_compat.packet_audit.all_pkesk_anonymous);
+
+    let dec_compat = decrypt_message(
+        &fresh_store,
+        DecryptRequest {
+            input_b64: enc_compat.output_b64,
+            passphrase: Some(compat_pw.into()),
+            allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("decrypt compat_seipd_v1 with RSA-4096 subkey");
+    assert_eq!(B64.decode(&dec_compat.plaintext_b64).unwrap(), msg_bytes);
+    assert_eq!(dec_compat.signature.status, "valid");
+
+    // 5. Simulate importing an external Kleopatra/GnuPG-format passphrase-protected v4 RSA-4096 key
+    //    (locked with S2K Usage 254 CFB + IteratedAndSalted + AES-256 and non-anonymous v3-PKESK message)
+    let mut kleo_sim_sk = sk.clone();
+    let kleo_pw_str = "external-kleopatra-test-passphrase";
+    let kleo_pw = Password::from(kleo_pw_str);
+    kleo_sim_sk.primary_key.remove_password(&Password::from(compat_pw)).unwrap();
+    kleo_sim_sk
+        .primary_key
+        .set_password(&mut rng, &kleo_pw)
+        .unwrap();
+    kleo_sim_sk.secret_subkeys[0]
+        .key
+        .remove_password(&Password::from(compat_pw))
+        .unwrap();
+    kleo_sim_sk.secret_subkeys[0]
+        .key
+        .set_password(&mut rng, &kleo_pw)
+        .unwrap();
+    let kleo_armored = kleo_sim_sk.to_armored_string(Default::default()).unwrap();
+
+    let mut kleo_store = SessionStore::default();
+    let kleo_imp = import_keys(
+        &mut kleo_store,
+        ImportKeyRequest {
+            data_b64: B64.encode(kleo_armored.as_bytes()),
+        },
+    )
+    .expect("import external passphrase-protected v4 RSA-4096 key");
+    assert_eq!(kleo_imp.imported.len(), 1);
+
+    // Build a standard GnuPG/Kleopatra-style v1-SEIPD message with non-anonymous v3-PKESK (carries subkey Key ID)
+    // and inline SHA-512 signature from the primary key
+    let kleo_sub_pub = kleo_sim_sk.secret_subkeys[0].key.public_key();
+    let mut builder =
+        pgp::composed::MessageBuilder::from_bytes("kleopatra.txt", b"Message from Kleopatra".to_vec())
+            .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    builder
+        .encrypt_to_key(&mut rng, &kleo_sub_pub)
+        .expect("non-anonymous v3 PKESK");
+    let subpackets_inline_512 = SubpacketConfig::UserDefined {
+        hashed: vec![
+            pgp::packet::Subpacket::regular(SubpacketData::IssuerFingerprint(
+                kleo_sim_sk.primary_key.fingerprint(),
+            ))
+            .unwrap(),
+            pgp::packet::Subpacket::regular(SubpacketData::SignatureCreationTime(
+                pgp::types::Timestamp::from_secs(TEST_NOW),
+            ))
+            .unwrap(),
+        ],
+        unhashed: vec![pgp::packet::Subpacket::regular(SubpacketData::IssuerKeyId(
+            kleo_sim_sk.primary_key.legacy_key_id(),
+        ))
+        .unwrap()],
+    };
+    builder.sign_with_subpackets(
+        &kleo_sim_sk.primary_key,
+        Password::from(kleo_pw_str),
+        HashAlgorithm::Sha512,
+        subpackets_inline_512,
+    );
+    let kleo_msg_armored = builder
+        .to_armored_string(&mut rng, Default::default())
+        .expect("serialize Kleopatra-style message");
+
+    let kleo_dec = decrypt_message(
+        &kleo_store,
+        DecryptRequest {
+            input_b64: B64.encode(kleo_msg_armored.as_bytes()),
+            passphrase: Some(kleo_pw_str.into()),
+            allow_legacy_seipd_v1: true,
+            now_secs: TEST_NOW,
+        },
+    )
+    .expect("decrypt Kleopatra-style v1-SEIPD + non-anon v3-PKESK + SHA-512 signed message");
+    assert_eq!(
+        B64.decode(&kleo_dec.plaintext_b64).unwrap(),
+        b"Message from Kleopatra"
+    );
+    assert_eq!(kleo_dec.signature.status, "valid");
 }

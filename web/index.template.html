@@ -246,16 +246,23 @@
       <!-- KEYGEN -->
       <section id="tab-keygen" class="tab-pane" hidden>
         <div class="stack">
-          <p class="muted small">
-            Generates an RFC 9580 v6 key: primary key <strong>Ed25519</strong> (Certify + Sign) and subkey <strong>X25519</strong> (Encrypt). Secret keys are exported passphrase-protected only (Argon2 + AES-256-OCB).
+          <div class="field">
+            <label for="kg-profile">Key generation profile</label>
+            <select id="kg-profile" autocomplete="off">
+              <option value="modern" selected>Modern (default) — OpenPGP v6: Ed25519 (Certify + Sign) + X25519 (Encrypt) · Argon2 + AES-256-OCB</option>
+              <option value="compat_rsa4096">Compatibility — OpenPGP v4: RSA-4096 (Certify + Sign) + RSA-4096 (Encrypt) · S2K Iterated+Salted SHA-256 + AES-256-CFB (Kleopatra / GnuPG)</option>
+            </select>
+          </div>
+          <p id="kg-profile-note" class="muted small">
+            <strong>Modern (default):</strong> Generates an RFC 9580 OpenPGP v6 key with primary key <strong>Ed25519</strong> (Certify + Sign) and subkey <strong>X25519</strong> (Encrypt). Secret keys are exported passphrase-protected only using <strong>Argon2</strong> (t=3, p=4, 64 MiB) + <strong>AES-256-OCB</strong> (S2K usage 253). The vault signs using <strong>SHA-256</strong>. Note: GnuPG 2.4.x / Kleopatra releases without RFC 9580 v6 support cannot import v6 keys; choose the <strong>Compatibility (OpenPGP v4 RSA-4096)</strong> profile for Kleopatra interoperability.
           </p>
           <div class="field">
-            <label for="kg-uid">Optional User ID (pseudonym allowed; may remain empty for v6)</label>
-            <input type="text" id="kg-uid" placeholder="e.g. pseudonym-01" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+            <label id="kg-uid-label" for="kg-uid">Optional User ID (pseudonym allowed; optional for v6 Modern, required for v4 Compatibility)</label>
+            <input type="text" id="kg-uid" placeholder="e.g. pseudonym-01 or Alice <alice@example.invalid>" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
           </div>
           <div class="grid-2">
             <div class="field">
-              <label for="kg-pw">Passphrase (required, min. 8 characters, 12+ recommended)</label>
+              <label for="kg-pw">Passphrase (required before private-key export, min. 8 characters, 12+ recommended)</label>
               <input type="password" id="kg-pw" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
             </div>
             <div class="field">
@@ -264,12 +271,13 @@
             </div>
           </div>
           <div class="row">
-            <button type="button" id="btn-keygen" class="btn btn-primary">Generate RFC 9580 v6 key</button>
+            <button type="button" id="btn-keygen" class="btn btn-primary">Generate key</button>
           </div>
 
           <div id="kg-result" class="result-box" hidden>
             <div class="result-head">
               <strong>New key generated</strong>
+              <span id="kg-profile-badge" class="badge badge-ok"></span>
               <span id="kg-fp" class="mono small"></span>
             </div>
             <div class="grid-2">

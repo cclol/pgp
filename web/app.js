@@ -25,6 +25,7 @@
   let lastSignBytes = null;
   let lastSignEpoch = 0;
   let lastSignIsArmor = true;
+  let lastKgEpoch = 0;
 
   function makeStaleError() {
     const err = new Error("Operation discarded due to session wipe.");
@@ -309,6 +310,8 @@
     $("dec-meta").textContent = "";
     $("dec-sig-box").textContent = "";
     $("ver-sig-box").textContent = "";
+    if ($("kg-fp")) $("kg-fp").textContent = "";
+    if ($("kg-profile-badge")) $("kg-profile-badge").textContent = "";
     zeroizeUint8(lastEncBytes);
     zeroizeUint8(lastDecBytes);
     zeroizeUint8(lastSignBytes);
@@ -318,6 +321,7 @@
     lastDecEpoch = 0;
     lastSignBytes = null;
     lastSignEpoch = 0;
+    lastKgEpoch = 0;
     plaintextClearAt = 0;
     sessionKeys = [];
     renderKeys();
@@ -1052,26 +1056,60 @@
     });
 
     // KEYGEN
+    function updateKeygenProfileUi() {
+      const profile = $("kg-profile").value;
+      const note = $("kg-profile-note");
+      const uidLabel = $("kg-uid-label");
+      if (profile === "compat_rsa4096") {
+        note.innerHTML =
+          "<strong>Compatibility (Kleopatra / GnuPG):</strong> Generates an OpenPGP v4 key with a primary <strong>RSA-4096</strong> key (Certify + Sign) and a separate <strong>RSA-4096</strong> subkey (Encrypt). Secret keys are exported passphrase-protected only using <strong>S2K Usage 254 (CFB + SHA-1 checksum) + Iterated &amp; Salted S2K (SHA-256, count=224 / 65,536,000 octets) + AES-256-CFB</strong>, which Kleopatra and GnuPG 2.2/2.4 import and unlock directly. The vault signs using <strong>SHA-256</strong> and verifies both SHA-256 and SHA-512 RSA signatures. Generation runs in the Wasm Worker (~5–25s); use <em>Abort operation</em> or <em>EMERGENCY WIPE</em> to cancel.";
+        uidLabel.textContent = "User ID (required for v4 Compatibility / Kleopatra; pseudonymous label or email allowed)";
+      } else {
+        note.innerHTML =
+          "<strong>Modern (default):</strong> Generates an RFC 9580 OpenPGP v6 key with primary key <strong>Ed25519</strong> (Certify + Sign) and subkey <strong>X25519</strong> (Encrypt). Secret keys are exported passphrase-protected only using <strong>Argon2</strong> (t=3, p=4, 64 MiB) + <strong>AES-256-OCB</strong> (S2K usage 253). The vault signs using <strong>SHA-256</strong>. Note: GnuPG 2.4.x / Kleopatra releases without RFC 9580 v6 support cannot import v6 keys; choose the <strong>Compatibility (OpenPGP v4 RSA-4096)</strong> profile for Kleopatra interoperability.";
+        uidLabel.textContent = "Optional User ID (pseudonym allowed; optional for v6 Modern, required for v4 Compatibility)";
+      }
+    }
+
+    $("kg-profile").addEventListener("change", updateKeygenProfileUi);
+    updateKeygenProfileUi();
+
     $("btn-keygen").addEventListener("click", async () => {
       const opEpoch = sessionEpoch;
+      const profile = $("kg-profile").value;
       const pw = $("kg-pw").value;
       const pw2 = $("kg-pw2").value;
       const uid = $("kg-uid").value;
       $("kg-pw").value = "";
       $("kg-pw2").value = "";
+      $("kg-pub").value = "";
+      $("kg-sec").value = "";
+      $("kg-fp").textContent = "";
+      $("kg-profile-badge").textContent = "";
+      $("kg-result").hidden = true;
+      lastKgEpoch = 0;
       try {
+        if (!pw || pw.length < 8) {
+          setStatus("Passphrase is required before generating or exporting a private key (minimum 8 characters, 12+ recommended).", "err");
+          return;
+        }
         if (pw !== pw2) {
           setStatus("Passphrases do not match.", "err");
           return;
         }
-        if (pw.length < 8) {
-          setStatus("Passphrase must be at least 8 characters long (12+ recommended).", "err");
+        if (profile === "compat_rsa4096" && !uid.trim()) {
+          setStatus("Compatibility failure: OpenPGP v4 (RSA-4096) keys require a non-empty User ID for Kleopatra / GnuPG import.", "err");
           return;
         }
-        setStatus("Generating RFC 9580 v6 key (Argon2 + Ed25519 + X25519)…", "busy");
+        if (profile === "compat_rsa4096") {
+          setStatus("Generating Compatibility OpenPGP v4 RSA-4096 + RSA-4096 key in Worker (UI remains responsive; click Abort operation or EMERGENCY WIPE to cancel)…", "busy");
+        } else {
+          setStatus("Generating Modern OpenPGP v6 key (Ed25519 + X25519, Argon2 + AES-256-OCB) in Worker…", "busy");
+        }
         const res = await rpc("GenerateKey", {
           user_id: uid.trim() ? uid.trim() : null,
           passphrase: pw,
+          profile,
           now_secs: Math.floor(Date.now() / 1000),
         }, opEpoch);
         if (opEpoch !== sessionEpoch) return;
@@ -1079,12 +1117,14 @@
           setStatus("Key generation failed: " + res.error, "err");
           return;
         }
+        lastKgEpoch = opEpoch;
         $("kg-fp").textContent = formatFp(res.data.summary.fingerprint);
+        $("kg-profile-badge").textContent = res.data.summary.version + " · " + res.data.summary.algorithm;
         $("kg-pub").value = res.data.public_key_armored;
         $("kg-sec").value = res.data.secret_key_armored;
-        $("kg-result").hidden = false;
         await refreshKeys(opEpoch);
         if (opEpoch !== sessionEpoch) return;
+        $("kg-result").hidden = false;
         setStatus("Key generated (" + res.data.profile + ") and loaded into session.", "ok");
       } catch (err) {
         if (opEpoch !== sessionEpoch || (err && err.staleEpoch)) return;
@@ -1092,9 +1132,16 @@
       }
     });
 
-    $("btn-kg-pub-copy").addEventListener("click", () => copyExplicit($("kg-pub").value, "Public key"));
-    $("btn-kg-sec-copy").addEventListener("click", () => copyExplicit($("kg-sec").value, "Secret key"));
+    $("btn-kg-pub-copy").addEventListener("click", () => {
+      if (lastKgEpoch !== sessionEpoch) return;
+      copyExplicit($("kg-pub").value, "Public key");
+    });
+    $("btn-kg-sec-copy").addEventListener("click", () => {
+      if (lastKgEpoch !== sessionEpoch) return;
+      copyExplicit($("kg-sec").value, "Secret key");
+    });
     $("btn-kg-pub-dl").addEventListener("click", () => {
+      if (lastKgEpoch !== sessionEpoch) return;
       const text = $("kg-pub").value;
       if (!text) return;
       const bytes = new TextEncoder().encode(text);
@@ -1105,6 +1152,7 @@
       }
     });
     $("btn-kg-sec-dl").addEventListener("click", () => {
+      if (lastKgEpoch !== sessionEpoch) return;
       const text = $("kg-sec").value;
       if (!text) return;
       const bytes = new TextEncoder().encode(text);
